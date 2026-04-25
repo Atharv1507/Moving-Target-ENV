@@ -1,5 +1,6 @@
 """HuggingFace Space entry point — runs the environment server + GRPO training loop.
 
+
 Environment variables:
   BASE_MODEL            HuggingFace model id (default: unsloth/Qwen2.5-1.5B-Instruct)
   OPENROUTER_API_KEY    Enables realistic persona requests during rollouts (optional)
@@ -8,6 +9,12 @@ Environment variables:
   EPISODES_PER_ROLLOUT  Episodes per training cycle (default: 5)
   TRAINING_CYCLES       Number of collect → train cycles (default: 3)
 """
+# Import unsloth FIRST before any trl/transformers to apply patches correctly
+try:
+    import unsloth  # noqa: F401
+except ImportError:
+    pass
+
 import atexit
 import logging
 import os

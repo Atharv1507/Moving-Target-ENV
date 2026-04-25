@@ -1,8 +1,14 @@
 """Loads the base language model and tokenizer for GRPO training.
 
-Uses Unsloth on CUDA (HuggingFace Space T4) for speed and memory efficiency.
-Falls back to standard HuggingFace + PEFT on CPU/MPS (local Mac development).
+Uses Unsloth on CUDA (HuggingFace Space T4) when compatible.
+Falls back to standard HuggingFace + PEFT on CPU/MPS or on version mismatch.
 """
+# Import unsloth FIRST before transformers/peft to apply its patches correctly
+try:
+    import unsloth  # noqa: F401
+except ImportError:
+    pass
+
 import os
 import torch
 
@@ -11,6 +17,29 @@ MAX_SEQ_LENGTH = 2048
 
 _model = None
 _tokenizer = None
+
+
+def _resolve_hf_model_name(name: str) -> str:
+    """Resolve a Hugging Face model id from BASE_MODEL.
+
+    Examples:
+    - unsloth/Qwen2.5-1.5B-Instruct -> Qwen/Qwen2.5-1.5B-Instruct
+    - unsloth/SomeOrg/Model          -> SomeOrg/Model
+    - Qwen/Qwen2.5-1.5B-Instruct     -> Qwen/Qwen2.5-1.5B-Instruct
+    """
+    if not name.startswith("unsloth/"):
+        return name
+
+    raw = name[len("unsloth/") :]
+    # If already org/model after removing unsloth, keep it.
+    if "/" in raw:
+        return raw
+
+    # Common unsloth shorthand for Qwen models.
+    if raw.startswith("Qwen"):
+        return f"Qwen/{raw}"
+
+    return raw
 
 
 def get_model_and_tokenizer():
@@ -67,8 +96,8 @@ def _load_with_hf():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import get_peft_model, LoraConfig, TaskType
 
-    # Strip "unsloth/" prefix to get the HuggingFace repo name
-    hf_name = MODEL_NAME.replace("unsloth/", "")
+    hf_name = _resolve_hf_model_name(MODEL_NAME)
+    print(f"[MODEL] HF fallback model id: {hf_name}", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(hf_name)
 
@@ -78,7 +107,7 @@ def _load_with_hf():
 
     model = AutoModelForCausalLM.from_pretrained(
         hf_name,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,      # `torch_dtype` is deprecated in new transformers
         device_map="auto",
     )
     lora_config = LoraConfig(
