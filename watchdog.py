@@ -9,7 +9,8 @@ dotenv.load_dotenv()
 watchdog_llm = ChatOpenAI(
     model=os.getenv("MODEL_NAME"),
     temperature=0.0,
-    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
 def watchdog_node(state: AgentState):

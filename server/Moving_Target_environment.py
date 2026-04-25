@@ -164,7 +164,8 @@ class MovingTargetEnv(Environment[MovingTargetAction, MovingTargetObservation, M
                 evaluator = ChatOpenAI(
                     model=os.getenv("MODEL_NAME"),
                     temperature=0.0,
-                    api_key=os.getenv("OPENAI_API_KEY"),
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=os.getenv("OPENROUTER_API_KEY"),
                 )
                 eval_prompt = f"""
                 You are the ultimate environment judge.

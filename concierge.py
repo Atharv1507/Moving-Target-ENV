@@ -71,7 +71,8 @@ tools = [ask_watchdog, getMerchant, place_order]
 # 2. Set up the Brain
 concierge_llm = ChatOpenAI(
     model=os.getenv("MODEL_NAME"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
 ).bind_tools(tools)
 
 def concierge_node(state: AgentState):
