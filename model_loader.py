@@ -3,11 +3,7 @@
 Uses Unsloth on CUDA (HuggingFace Space T4) when compatible.
 Falls back to standard HuggingFace + PEFT on CPU/MPS or on version mismatch.
 """
-# Import unsloth FIRST before transformers/peft to apply its patches correctly
-try:
-    import unsloth  # noqa: F401
-except ImportError:
-    pass
+import unsloth  # noqa: F401 — must be first import
 
 import os
 import torch
@@ -91,6 +87,9 @@ def _load_with_unsloth():
         max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=True,
     )
+    # Set use_cache=False at load time to prevent transformers from patching it
+    model.config.use_cache = False
+
     # Add LoRA adapters — only these weights get updated during GRPO
     model = FastLanguageModel.get_peft_model(
         model,
@@ -127,6 +126,9 @@ def _load_with_hf(resume_adapter_path: str | None = None):
         dtype=torch_dtype,      # `torch_dtype` is deprecated in new transformers
         device_map="auto",
     )
+
+    # Set use_cache=False at load time to prevent transformers from patching it
+    model.config.use_cache = False
 
     if resume_adapter_path:
         # Load previously saved adapter and keep it trainable for continued GRPO.

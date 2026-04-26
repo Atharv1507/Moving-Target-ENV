@@ -1,9 +1,5 @@
 """Runs episodes with the local model as a fintech payment agent and collects training data."""
-# Import unsloth FIRST before any trl/transformers to avoid import-order warnings
-try:
-    import unsloth  # noqa: F401
-except ImportError:
-    pass
+import unsloth  # noqa: F401 — must be first import
 
 import json
 import os

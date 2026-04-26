@@ -1,13 +1,11 @@
 """GRPO training using TRL + Unsloth."""
-# Import unsloth FIRST before trl/transformers to avoid import-order warnings
-try:
-    import unsloth  # noqa: F401
-except ImportError:
-    pass
+import unsloth  # noqa: F401 — must be first import
 
 import json
 import math
 import os
+import shutil
+import warnings
 
 import requests
 import torch
@@ -25,6 +23,12 @@ ENTROPY_COEF = 0.05
 
 SERVER_URL = os.getenv("ENV_SERVER_URL", "http://localhost:8001/")
 ALLOWED_TOOLS = {"getProviders", "check_provider", "execute_transaction"}
+
+# Sanity-check test prompts — both must produce valid JSON after a GRPO update.
+_SANITY_PROMPTS = [
+    'You are a fintech shopping assistant.\nUser: Send $100 via Wise.\nAssistant:',
+    'You are a fintech shopping assistant.\nUser: List available providers.\nAssistant:',
+]
 
 
 # ── reward function ───────────────────────────────────────────────────────────
@@ -220,6 +224,69 @@ class _StepLoggerCallback(TrainerCallback):
         }
 
 
+# ── checkpoint helpers ────────────────────────────────────────────────────────
+
+def _save_checkpoint(model, tokenizer, path: str) -> None:
+    """Save adapter weights to *path* (overwrites if it exists)."""
+    os.makedirs(path, exist_ok=True)
+    model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
+
+
+def _restore_checkpoint(model, tokenizer, path: str) -> None:
+    """Reload adapter weights in-place from a previously saved checkpoint."""
+    from peft import set_peft_model_state_dict
+    import safetensors.torch
+
+    # Load the adapter state dict from the checkpoint directory.
+    weight_file = os.path.join(path, "adapter_model.safetensors")
+    if os.path.exists(weight_file):
+        state_dict = safetensors.torch.load_file(weight_file, device=str(model.device))
+    else:
+        bin_file = os.path.join(path, "adapter_model.bin")
+        state_dict = torch.load(bin_file, map_location=model.device, weights_only=True)
+
+    set_peft_model_state_dict(model, state_dict)
+    print(f"[GRPO] Restored adapter weights from {path}", flush=True)
+
+
+def _sanity_check(model, tokenizer) -> bool:
+    """Generate from 2 test prompts — both must parse as valid JSON.
+
+    Returns True if sanity check passes, False otherwise.
+    """
+    model.eval()
+    passed = 0
+    for prompt_text in _SANITY_PROMPTS:
+        try:
+            inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=64,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            new_ids = output_ids[0][inputs["input_ids"].shape[1]:]
+            text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+            parsed = _parse_tool_call(text)
+            if parsed is not None and isinstance(parsed, dict):
+                passed += 1
+                print(f"[SANITY] ✓ Got valid JSON: {text[:80]!r}", flush=True)
+            else:
+                print(f"[SANITY] ✗ No valid JSON from: {text[:80]!r}", flush=True)
+        except Exception as e:
+            print(f"[SANITY] ✗ Generation error: {e}", flush=True)
+
+    ok = passed == len(_SANITY_PROMPTS)
+    if ok:
+        print("[SANITY] All test prompts passed.", flush=True)
+    else:
+        print(f"[SANITY] FAILED — only {passed}/{len(_SANITY_PROMPTS)} passed.", flush=True)
+    return ok
+
+
 # ── main public function ──────────────────────────────────────────────────────
 
 def train_with_grpo(
@@ -239,6 +306,27 @@ def train_with_grpo(
         cycle_metrics:  Pre-computed rollout metrics dict for the cycle summary.
     """
     model, tokenizer = get_model_and_tokenizer()
+
+    # ── Guard: skip update if all episode rewards are identical (zero variance) ──
+    episode_rewards: dict[int, float] = {}
+    for item in rollout_buffer:
+        ep = int(item.get("episode", 0))
+        if ep > 0:
+            episode_rewards[ep] = episode_rewards.get(ep, 0.0) + float(item.get("reward", 0.0))
+
+    reward_values = list(episode_rewards.values())
+    if len(set(reward_values)) <= 1:
+        warnings.warn(
+            f"[GRPO] Cycle {cycle}: all {len(reward_values)} episode rewards are identical "
+            f"({reward_values[0] if reward_values else 0.0}) — zero variance. "
+            f"Skipping GRPO update to avoid degenerate gradient.",
+            stacklevel=2,
+        )
+        print(
+            f"[GRPO] Cycle {cycle}: SKIPPED — zero reward variance across episodes.",
+            flush=True,
+        )
+        return
 
     dataset = Dataset.from_list([{"prompt": r["prompt"]} for r in rollout_buffer])
 
@@ -266,6 +354,11 @@ def train_with_grpo(
         save_strategy="no",
     )
 
+    # ── Save pre-update checkpoint for rollback ──
+    pre_update_path = os.path.join(output_dir, f"_pre-update-cycle-{cycle}")
+    _save_checkpoint(model, tokenizer, pre_update_path)
+    print(f"[GRPO] Pre-update checkpoint saved to {pre_update_path}", flush=True)
+
     cb = _StepLoggerCallback(cycle=cycle)
 
     trainer = GRPOTrainer(
@@ -279,6 +372,21 @@ def train_with_grpo(
 
     print(f"[GRPO] Cycle {cycle} — starting: {len(dataset)} prompts, {max_steps} steps.", flush=True)
     trainer.train()
+
+    # ── Post-update sanity check — rollback if model is broken ──
+    if not _sanity_check(model, tokenizer):
+        print(
+            f"[GRPO] Cycle {cycle}: post-update sanity check FAILED — "
+            f"rolling back to pre-update checkpoint.",
+            flush=True,
+        )
+        _restore_checkpoint(model, tokenizer, pre_update_path)
+        # Verify rollback worked
+        if _sanity_check(model, tokenizer):
+            print(f"[GRPO] Rollback successful — model restored.", flush=True)
+        else:
+            print(f"[GRPO] WARNING: rollback sanity check also failed!", flush=True)
+        return
 
     # Per-cycle summary via logger
     summary = cb.cycle_summary()
@@ -305,3 +413,6 @@ def train_with_grpo(
     model.save_pretrained(final_path)
     tokenizer.save_pretrained(final_path)
     print(f"[GRPO] Final adapter updated at {final_path}", flush=True)
+
+    # Clean up pre-update checkpoint on success
+    shutil.rmtree(pre_update_path, ignore_errors=True)

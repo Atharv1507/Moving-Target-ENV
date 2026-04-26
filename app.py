@@ -9,11 +9,7 @@ Environment variables:
   EPISODES_PER_ROLLOUT  Episodes per training cycle (default: 5)
   TRAINING_CYCLES       Number of collect → train cycles (default: 3)
 """
-# Import unsloth FIRST before any trl/transformers to apply patches correctly
-try:
-    import unsloth  # noqa: F401
-except ImportError:
-    pass
+import unsloth  # noqa: F401 — must be first import
 
 import atexit
 import json
@@ -168,10 +164,17 @@ def _append_cycle_metrics(output_dir: str, cycle_idx: int, rollout_buffer: list[
 
 # ── training loop ─────────────────────────────────────────────────────────────
 
+MIN_EPISODES_PER_ROLLOUT = 30
+
+
 def run_training_loop(
     cycles: int = DEFAULT_TRAINING_CYCLES,
     episodes_per_rollout: int = DEFAULT_EPISODES_PER_ROLLOUT,
 ) -> None:
+    # Enforce minimum episodes per rollout — silently clamp
+    if episodes_per_rollout < MIN_EPISODES_PER_ROLLOUT:
+        episodes_per_rollout = MIN_EPISODES_PER_ROLLOUT
+
     output_dir = _resolve_output_dir()
     resume_path = os.path.join(output_dir, "final-adapter")
     # Let model_loader auto-resume if adapter exists from previous runs.
