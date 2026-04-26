@@ -241,9 +241,9 @@ def launch_gradio_ui() -> None:
     """Launch a minimal control panel to trigger one-cycle GRPO runs."""
     import gradio as gr
 
-    with gr.Blocks(title="Moving Target GRPO Runner") as demo:
-        gr.Markdown("# Moving Target GRPO Runner")
-        gr.Markdown("Use the button below to run exactly one collect + train cycle.")
+    with gr.Blocks(title="Fintech Transaction Agent — GRPO Runner") as demo:
+        gr.Markdown("# Fintech Transaction Agent — GRPO Runner")
+        gr.Markdown("Train the agent to execute payments/withdrawals via shifting fintech provider APIs. Click **Run 1 Cycle** to collect rollouts and run one GRPO update.")
         episodes = gr.Slider(
             minimum=1,
             maximum=20,

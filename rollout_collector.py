@@ -1,4 +1,4 @@
-"""Runs episodes with the local model as concierge and collects training data."""
+"""Runs episodes with the local model as a fintech payment agent and collects training data."""
 # Import unsloth FIRST before any trl/transformers to avoid import-order warnings
 try:
     import unsloth  # noqa: F401
@@ -18,55 +18,52 @@ from model_loader import get_model_and_tokenizer
 MAX_STEPS_PER_EPISODE = 15
 
 FALLBACK_REQUESTS = [
-    "I need a Vegan meal under $40 with a flexible refund policy.",
-    "Get me something Halal, budget is $50, must be refundable.",
-    "I want to order food, no dietary restrictions, cheapest option possible.",
-    "I need a Keto meal under $30 — also I have a dog so pet-friendly is a must.",
-    "Looking for Gluten-Free options, budget $100, strictly refundable please.",
-    "Order me anything under $20, No Restrictions on diet.",
-    "I want a Vegan and Nut-Free meal, budget is $80, flexible returns preferred.",
+    "I need to send $200 to India via UPI. The fee must be under 2% and I want same-day settlement.",
+    "Withdraw $500 from my Stripe balance to my US bank account. I need instant settlement.",
+    "Pay a contractor £300 to a UK account. I need GBP support and low fees please.",
+    "Transfer ₹10,000 domestically via IFSC. Budget is tight so keep fees minimal.",
+    "Send $1000 internationally to Europe. I only have basic KYC — need a provider that accepts that.",
+    "Pay an invoice of $750 USD. I need a reference_note field and I can't pay more than 1% fee.",
+    "Move $50 to a PayPal-compatible provider. Currency USD, no strict KYC, instant if possible.",
 ]
 
 CONCIERGE_SYSTEM_PROMPT = (
-    "You are an E-Commerce AI Concierge. Your ONLY job is to call tools using JSON.\n\n"
+    "You are a Fintech Payment AI Agent. Your ONLY job is to execute financial transactions by calling tools using JSON.\n\n"
     "════════════════════════════════════════════════════════\n"
-    "CRITICAL: EVERY response you generate MUST be a JSON object.\n"
+    "CRITICAL: EVERY response MUST be a single JSON object.\n"
     "NEVER write plain text. NEVER write explanations. NEVER write lists.\n"
     "IF YOUR RESPONSE IS NOT A JSON OBJECT, YOU HAVE FAILED.\n"
     "════════════════════════════════════════════════════════\n\n"
-    "TOOL FORMAT — output EXACTLY one of these JSON objects, nothing else:\n"
-    '- List merchants:  {"tool": "getMerchant"}\n'
-    '- Check merchant:  {"tool": "ask_watchdog", "merchant_name": "NAME"}\n'
-    '-Make sure to ask only one merchant at a time'
-    '- Place order:     {"tool": "place_order", "merchant_name": "NAME", "payload": {"field": "value"}}\n\n'
+    "TOOL FORMAT — output EXACTLY one of these JSON objects per turn:\n"
+    '- List providers:      {"tool": "getProviders"}\n'
+    '- Check provider:      {"tool": "check_provider", "provider_name": "NAME"}\n'
+    '- Execute transaction: {"tool": "execute_transaction", "provider_name": "NAME", "payload": {"field": "value"}}\n\n'
     "RULES:\n"
-    "1. Always call getMerchant first to discover available merchants.\n"
-    "2. Always call ask_watchdog BEFORE place_order for any merchant.\n"
-    "3. The place_order payload must contain EXACTLY the fields from ask_watchdog's required_fields.\n"
-    "4. Check price / refund / diet policies match the user's constraints.\n"
-    "5. Invent any missing details (name, address, contact) — do NOT ask the user.\n"
-    "6. If place_order fails, fix the payload and retry immediately with a JSON tool call.\n"
-    "7. ONLY after a successful place_order, write a plain text summary — this is the ONLY time plain text is allowed.\n\n"
-    "EXAMPLE OF CORRECT MULTI-STEP BEHAVIOR:\n"
-    'User: "Order halal food under $40"\n'
-    'You: {"tool": "getMerchant"}\n'
-    '[Tool Result]: ["HalalKitchen", "BurgerBar"]\n'
-    'You: {"tool": "ask_watchdog", "merchant_name": "HalalKitchen"}\n'
-    '[Tool Result]: {"required_fields": ["customer_name", "item", "price"]}\n'
-    'You: {"tool": "place_order", "merchant_name": "HalalKitchen", "payload": {"customer_name": "Alex", "item": "chicken wrap", "price": "35"}}\n'
+    "1. Always call getProviders first to discover available fintech services.\n"
+    "2. Always call check_provider BEFORE execute_transaction for any provider.\n"
+    "3. The execute_transaction payload must contain EXACTLY the fields listed in check_provider's required_fields — no more, no less.\n"
+    "4. Match the user's constraints: fee limit, currency, KYC level, settlement time.\n"
+    "5. Invent any missing transaction details (sender name, account numbers, reference) — do NOT ask the user.\n"
+    "6. If execute_transaction fails, call check_provider again (schema may have drifted), then retry with corrected payload.\n"
+    "7. ONLY after a successful execute_transaction, write a plain text confirmation — this is the ONLY time plain text is allowed.\n\n"
+    "EXAMPLE OF CORRECT MULTI-STEP BEHAVIOUR:\n"
+    'User: "Send $200 to India, fee under 2%, instant settlement"\n'
+    'You: {"tool": "getProviders"}\n'
+    '[Tool Result]: ["Stripe", "Razorpay", "Wise", "PayPal"]\n'
+    'You: {"tool": "check_provider", "provider_name": "Wise"}\n'
+    '[Tool Result]: {"required_fields": ["amount", "currency", "beneficiary_name", "account_number"], "transaction_fee": "0.5%", "settlement_time": "instant"}\n'
+    'You: {"tool": "execute_transaction", "provider_name": "Wise", "payload": {"amount": "200", "currency": "INR", "beneficiary_name": "Raj Kumar", "account_number": "9876543210"}}\n'
     '[Tool Result]: {"status": "success"}\n'
-    'You: Order placed at HalalKitchen for $35.\n\n'
-    "REMEMBER: Every response is a JSON tool call UNTIL the order succeeds.\n"
-    "NO PROSE. NO LISTS. NO EXPLANATIONS. JSON ONLY."
-    "After place_order succeeds, write plain text only. DO NOT wrap the summary in JSON or curly braces."
+    'You: Transaction of $200 sent via Wise. Fee: 0.5%, settled instantly.\n\n'
+    "REMEMBER: Every response is a JSON tool call UNTIL execute_transaction succeeds.\n"
+    "NO PROSE. NO LISTS. NO EXPLANATIONS. JSON ONLY until success."
 )
 
 # Model tool name → environment server tool name
 _TOOL_NAME_MAP = {
-    "getMerchant": "get_merchants",
-    "check_merchant": "ask_watchdog",
-    "ask_watchdog": "ask_watchdog",
-    "place_order": "place_order",
+    "getProviders":          "get_providers",
+    "check_provider":        "check_provider",
+    "execute_transaction":   "execute_transaction",
 }
 _ALLOWED_MODEL_TOOLS = set(_TOOL_NAME_MAP.keys())
 _MAX_REPEAT_ACTIONS = 4
@@ -109,8 +106,8 @@ def _generate(prompt: str, max_new_tokens: int = 256) -> str:
 def _parse_tool_call(text: str) -> dict | None:
     """Extract the first balanced JSON object from model output.
 
-    Uses brace counting instead of a flat regex so nested dicts (place_order
-    payloads) are parsed correctly.
+    Uses brace counting instead of a flat regex so nested dicts
+    (execute_transaction payloads) are parsed correctly.
     """
     start = text.find("{")
     if start == -1:
@@ -155,51 +152,65 @@ def _safe_json_loads(value: str) -> dict | list | None:
 
 
 def _extract_user_needs(text: str) -> dict:
-    """Extract lightweight user preferences to seed deterministic payload fields."""
+    """Extract lightweight user preferences from the persona request."""
     low = (text or "").lower()
     needs = {
-        "dietary_notes": "",
-        "refund_pref": "",
+        "currency": "USD",
+        "fee_pref": "",
+        "settlement_pref": "",
+        "kyc_level": "basic",
     }
-    diet_tags = []
-    for key in ("vegan", "halal", "keto", "gluten-free", "gluten free", "nut-free", "nut free", "low-carb", "low carb"):
-        if key in low:
-            diet_tags.append(key.replace("-", " "))
-    if diet_tags:
-        needs["dietary_notes"] = ", ".join(sorted(set(diet_tags)))
-    if "strictly refundable" in low or "strict refund" in low:
-        needs["refund_pref"] = "strictly refundable"
-    elif "flexible refund" in low or "pet-friendly refund" in low or "pet friendly refund" in low:
-        needs["refund_pref"] = "flexible refund preferred"
+    for cur in ("inr", "eur", "gbp", "aed", "sgd", "usd"):
+        if cur in low:
+            needs["currency"] = cur.upper()
+            break
+    if "instant" in low:
+        needs["settlement_pref"] = "instant"
+    elif "same day" in low or "same-day" in low:
+        needs["settlement_pref"] = "same day"
+    if "no kyc" in low or "no strict kyc" in low:
+        needs["kyc_level"] = "none"
+    elif "full kyc" in low:
+        needs["kyc_level"] = "full"
+    if "under 1%" in low or "1% fee" in low:
+        needs["fee_pref"] = "under 1%"
+    elif "under 2%" in low or "2% fee" in low:
+        needs["fee_pref"] = "under 2%"
     return needs
 
 
-def _default_value_for_field(field: str, merchant_name: str, user_needs: dict) -> str:
+def _default_value_for_field(field: str, provider_name: str, user_needs: dict) -> str:
+    """Return a sensible deterministic default for any required transaction field."""
+    currency = user_needs.get("currency", "USD")
     defaults = {
-        "item": "chef special meal",
-        "price": "50",
-        "dietary_notes": user_needs.get("dietary_notes") or "no dietary restrictions",
-        "delivery_address": "221B Baker Street",
-        "contact_number": "+1-555-0101",
-        "customer_name": "Alex Customer",
-        "discount_code": "NONE",
-        "special_instructions": user_needs.get("refund_pref") or "leave at door",
-        "payment_method": "card",
-        "quantity": "1",
+        "amount":           "200",
+        "currency":         currency,
+        "beneficiary_name": "Alex Johnson",
+        "account_number":   "9876543210",
+        "ifsc_code":        "HDFC0001234",
+        "routing_number":   "021000021",
+        "swift_code":       "HDFCINBB",
+        "upi_id":           "alex@upi",
+        "reference_note":   "Invoice payment",
+        "payment_method":   "bank_transfer",
+        "purpose_code":     "P0101",
+        "transaction_type": "transfer",
+        "sender_name":      "Sam Sender",
+        "contact_number":   "+1-555-0101",
     }
-    return defaults.get(field, f"default_{merchant_name}_{field}")
+    return defaults.get(field, f"default_{provider_name}_{field}")
 
 
 def _build_payload_from_required_fields(
     required_fields: list[str],
-    merchant_name: str,
+    provider_name: str,
     user_needs: dict,
 ) -> dict:
-    """Build exact-schema payload deterministically."""
-    payload = {}
-    for field in required_fields:
-        payload[field] = _default_value_for_field(field, merchant_name, user_needs)
-    return payload
+    """Build an exact-schema payload deterministically."""
+    return {
+        field: _default_value_for_field(field, provider_name, user_needs)
+        for field in required_fields
+    }
 
 
 def _extract_reward(obs: dict, response_json: dict) -> float:
@@ -219,21 +230,16 @@ def _execute_tool(tool_call: dict, server_base_url: str) -> tuple[float, str, bo
     then POSTs to /step and returns (reward, observation_data, episode_done).
     """
     model_tool = tool_call.get("tool", "")
-    env_tool = _TOOL_NAME_MAP.get(model_tool, model_tool)  # fix getMerchant → get_merchants
+    env_tool = _TOOL_NAME_MAP.get(model_tool, model_tool)
 
-    merchant_name = tool_call.get("merchant_name")
-    if merchant_name is None and isinstance(tool_call.get("merchant_names"), list):
-        merchant_list = tool_call.get("merchant_names") or []
-        merchant_name = merchant_list[0] if merchant_list else None
+    provider_name = tool_call.get("provider_name", "")
+    if not provider_name and model_tool == "getProviders":
+        provider_name = "directory"
 
     action = {
-        "tool": env_tool,
-        "merchant_name": (
-            "directory"                                  # getMerchant placeholder
-            if model_tool == "getMerchant"
-            else (merchant_name or "unknown")
-        ),
-        "payload": tool_call.get("payload") or {},
+        "tool":          env_tool,
+        "provider_name": provider_name or "unknown",
+        "payload":       tool_call.get("payload") or {},
     }
 
     try:
@@ -278,7 +284,7 @@ def _get_persona_request(server_base_url: str, fallback_idx: int) -> str:
 # ── main public function ──────────────────────────────────────────────────────
 
 def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
-    """Run episodes and collect (prompt, completion, reward) per concierge step."""
+    """Run episodes and collect (prompt, completion, reward) per agent step."""
     rollout_buffer: list[dict] = []
 
     for ep in range(episodes):
@@ -291,6 +297,17 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
             continue
 
         persona_request = _get_persona_request(server_base_url, ep)
+        constraint = persona_request
+
+        try:
+            requests.post(
+                f"{server_base_url}set_constraint",
+                json={"constraint": constraint},
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"[ROLLOUT] set_constraint failed: {e}", flush=True)
+
         print(f"[ROLLOUT]   Persona: {persona_request[:80]}", flush=True)
 
         messages = [
@@ -298,8 +315,8 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
             {"role": "user", "content": persona_request},
         ]
         user_needs = _extract_user_needs(persona_request)
-        merchant_required_fields: dict[str, list[str]] = {}
-        watchdog_seen: set[str] = set()
+        provider_required_fields: dict[str, list[str]] = {}
+        check_seen: set[str] = set()
         last_action_sig = ""
         repeat_action_count = 0
 
@@ -308,69 +325,62 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
             prompt = _build_prompt(messages)
             completion = _generate(prompt)
 
-            # Always log what the model actually said (trimmed)
             print(f"[ROLLOUT]   step {step + 1} model output: {completion[:120]!r}", flush=True)
 
             raw_tool_call = _parse_tool_call(completion)
             tool_call, status = _validate_tool_call(raw_tool_call)
+
             if tool_call is None:
                 print(
                     f"[ROLLOUT]   step {step + 1}: invalid/no tool call ({status}) → episode end (reward 0)",
                     flush=True,
                 )
-                rollout_buffer.append(
-                    {
-                        "prompt": prompt,
-                        "completion": completion,
-                        "reward": 0.0,
-                        "episode": ep + 1,
-                        "tool": "__invalid_tool__" if status == "unknown_tool" else "__no_tool__",
-                        "done": True,
-                    }
-                )
+                rollout_buffer.append({
+                    "prompt":     prompt,
+                    "completion": completion,
+                    "reward":     0.0,
+                    "episode":    ep + 1,
+                    "tool":       "__invalid_tool__" if status == "unknown_tool" else "__no_tool__",
+                    "done":       True,
+                })
                 break
 
-            merchant_name = tool_call.get("merchant_name")
-            if merchant_name is None and isinstance(tool_call.get("merchant_names"), list):
-                names = tool_call.get("merchant_names") or []
-                merchant_name = names[0] if names else "unknown"
-            merchant_name = merchant_name or "unknown"
-
-            action_sig = f"{tool_call.get('tool')}::{merchant_name}"
+            provider_name = tool_call.get("provider_name", "")
+            action_sig = f"{tool_call.get('tool')}::{provider_name}"
             if action_sig == last_action_sig:
                 repeat_action_count += 1
             else:
                 repeat_action_count = 1
                 last_action_sig = action_sig
+
             if repeat_action_count >= _MAX_REPEAT_ACTIONS:
                 print(
-                    f"[ROLLOUT]   step {step + 1}: detected action loop on {action_sig} → episode end",
+                    f"[ROLLOUT]   step {step + 1}: action loop on {action_sig} → episode end",
                     flush=True,
                 )
-                rollout_buffer.append(
-                    {
-                        "prompt": prompt,
-                        "completion": completion,
-                        "reward": -10.0,
-                        "episode": ep + 1,
-                        "tool": "__loop_guard__",
-                        "done": True,
-                    }
-                )
+                rollout_buffer.append({
+                    "prompt":     prompt,
+                    "completion": completion,
+                    "reward":     -10.0,
+                    "episode":    ep + 1,
+                    "tool":       "__loop_guard__",
+                    "done":       True,
+                })
                 episode_reward += -10.0
                 break
 
-            if tool_call.get("tool") == "place_order":
-                if merchant_name not in watchdog_seen:
+            # Force check_provider before execute_transaction
+            if tool_call.get("tool") == "execute_transaction":
+                if provider_name not in check_seen:
                     print(
-                        f"[ROLLOUT]   step {step + 1}: forcing ask_watchdog before place_order for {merchant_name}",
+                        f"[ROLLOUT]   step {step + 1}: forcing check_provider before execute_transaction for {provider_name}",
                         flush=True,
                     )
-                    tool_call = {"tool": "ask_watchdog", "merchant_name": merchant_name}
-                elif merchant_name in merchant_required_fields:
+                    tool_call = {"tool": "check_provider", "provider_name": provider_name}
+                elif provider_name in provider_required_fields:
                     tool_call["payload"] = _build_payload_from_required_fields(
-                        merchant_required_fields[merchant_name],
-                        merchant_name,
+                        provider_required_fields[provider_name],
+                        provider_name,
                         user_needs,
                     )
 
@@ -382,65 +392,58 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
                 flush=True,
             )
 
-            rollout_buffer.append(
-                {
-                    "prompt": prompt,
-                    "completion": completion,
-                    "reward": reward,
-                    "episode": ep + 1,
-                    "tool": tool_call.get("tool", "unknown"),
-                    "done": done,
-                }
-            )
+            rollout_buffer.append({
+                "prompt":     prompt,
+                "completion": completion,
+                "reward":     reward,
+                "episode":    ep + 1,
+                "tool":       tool_call.get("tool", "unknown"),
+                "done":       done,
+            })
 
-            if tool_call.get("tool") in ("ask_watchdog", "check_merchant"):
-                watchdog_seen.add(merchant_name)
+            # Cache required fields after a successful check_provider
+            if tool_call.get("tool") == "check_provider":
+                check_seen.add(provider_name)
                 parsed_obs = _safe_json_loads(obs_data) if isinstance(obs_data, str) else obs_data
                 if isinstance(parsed_obs, dict):
                     req = parsed_obs.get("required_fields")
                     if isinstance(req, list):
-                        merchant_required_fields[merchant_name] = [str(x) for x in req]
+                        provider_required_fields[provider_name] = [str(f) for f in req]
 
+            # Corrective retry on hard execute_transaction rejection
             if (
-                tool_call.get("tool") == "place_order"
-                and reward <= -50.0
-                and merchant_name in merchant_required_fields
+                tool_call.get("tool") == "execute_transaction"
+                and reward <= -15.0
+                and provider_name in provider_required_fields
             ):
                 retry_call = {
-                    "tool": "place_order",
-                    "merchant_name": merchant_name,
-                    "payload": _build_payload_from_required_fields(
-                        merchant_required_fields[merchant_name],
-                        merchant_name,
+                    "tool":          "execute_transaction",
+                    "provider_name": provider_name,
+                    "payload":       _build_payload_from_required_fields(
+                        provider_required_fields[provider_name],
+                        provider_name,
                         user_needs,
                     ),
                 }
                 retry_completion = json.dumps(retry_call)
                 retry_reward, retry_obs, retry_done = _execute_tool(retry_call, server_base_url)
                 episode_reward += retry_reward
-                done = True  # single corrective retry, then terminate to avoid loops
+                done = True  # single corrective retry, then terminate
                 print(
                     f"[ROLLOUT]   step {step + 1}: corrective retry reward={retry_reward:.1f} done={retry_done}",
                     flush=True,
                 )
-                rollout_buffer.append(
-                    {
-                        "prompt": prompt,
-                        "completion": retry_completion,
-                        "reward": retry_reward,
-                        "episode": ep + 1,
-                        "tool": "place_order_retry",
-                        "done": True,
-                    }
-                )
+                rollout_buffer.append({
+                    "prompt":     prompt,
+                    "completion": retry_completion,
+                    "reward":     retry_reward,
+                    "episode":    ep + 1,
+                    "tool":       "execute_transaction_retry",
+                    "done":       True,
+                })
                 obs_data = retry_obs
 
             messages.append({"role": "assistant", "content": completion})
-
-            # hint the model after getMerchant
-            if tool_call.get("tool") == "getMerchant":
-                obs_data = f"{obs_data}\nNext: call ask_watchdog for the specific merchant the user mentioned."
-
             messages.append({"role": "user", "content": f"[Tool Result]: {obs_data}"})
 
             if done:

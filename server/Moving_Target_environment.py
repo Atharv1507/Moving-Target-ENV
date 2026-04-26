@@ -8,163 +8,174 @@ from langchain_openai import ChatOpenAI
 import dotenv
 dotenv.load_dotenv()
 
-from models import MovingTargetAction, MovingTargetObservation, MovingTargetEnvironmentState
+from models import FintechAction, FintechObservation, FintechEnvironmentState
 
-# Potential fields that a merchant might demand
+# All possible fields a fintech provider API may require
 POTENTIAL_FIELDS = [
-    "item", "price", "dietary_notes", "delivery_address", 
-    "contact_number", "customer_name", "discount_code", 
-    "special_instructions", "payment_method", "quantity",
+    "amount",
+    "currency",
+    "beneficiary_name",
+    "account_number",
+    "ifsc_code",
+    "routing_number",
+    "swift_code",
+    "upi_id",
+    "reference_note",
+    "payment_method",
+    "purpose_code",
+    "transaction_type",
+    "sender_name",
+    "contact_number",
 ]
 
-class MovingTargetEnv(Environment[MovingTargetAction, MovingTargetObservation, MovingTargetEnvironmentState]):
-    # CLASS VARIABLES to persist across FastAPI HTTP request instantiations
+
+class MovingTargetEnv(Environment[FintechAction, FintechObservation, FintechEnvironmentState]):
+    # CLASS VARIABLES — persist across FastAPI HTTP request instantiations
     ground_truth = {}
     _global_step_count = 0
     ground_truth_constraint = ""
     _directory_rewarded = False
 
-
     def __init__(self):
         super().__init__()
-        self.initial_merchants = ["PizzaPalace","VeganBistro", "GreenLeaf_Dining", "SpiceSymphony", "BurgerBar", "SushiStation","CurryHouse","PastaParadise","TacoTown","NoodleNook"]
-        # Only initialize once across the whole server
+        self.initial_providers = [
+            "Stripe", "Razorpay", "PayPal", "Wise", "Revolut",
+            "Cashfree", "Paytm", "PhonePe", "Braintree", "Square",
+        ]
         if not MovingTargetEnv.ground_truth:
             self._initialize_world()
 
-    def _generate_random_schema(self):
-        """Creates a completely random API schema."""
-        # Pick 2 to 5 required fields randomly
+    def _generate_random_schema(self) -> dict:
+        """Generate a randomised fintech provider API schema."""
         num_fields = random.randint(2, 5)
-        # Always guarantee 'item' is inside since it's food ordering
-        fields = {"item",} 
+        # Always require amount — every payment needs it
+        fields = {"amount"}
         while len(fields) < num_fields:
             fields.add(random.choice(POTENTIAL_FIELDS))
-            
+
         return {
             "api_version": f"v{random.randint(1, 5)}.{random.randint(0, 9)}",
             "required_fields": list(fields),
-            "refund_policy": random.choice([
-                "Always fully refundable",
-                "Non-refundable for orders under $50",
-                "Strictly non-refundable",
-                "Flexible within 10 minutes of ordering"
-            ]),
-            "other_policies":random.choice(["Pet-Friendly", "Not Pet-Friendly", "Vegan Options Available", "Gluten-Free Options Available", "Nut-Free Options Available", "Halal Options Available", "Low-Carb Options Available"]),
-            "average_price_for_1": random.choice(["$30", "$50", "$100","$20","$80" ]),
+            "transaction_fee": random.choice(["0.5%", "1%", "1.5%", "2%", "$1 flat", "$2 flat", "$3 flat"]),
+            "supported_currencies": random.sample(["USD", "INR", "EUR", "GBP", "AED", "SGD"], k=random.randint(2, 4)),
+            "transfer_limit": random.choice(["$1,000/day", "$5,000/day", "$10,000/day", "$50,000/day"]),
+            "kyc_required": random.choice(["none", "basic", "full"]),
+            "settlement_time": random.choice(["instant", "same day", "1-2 days", "3-5 days"]),
         }
 
-    def _drift_schema(self, merchant_name: str):
-        """Mutates an existing schema to simulate 'drift'."""
-        schema = MovingTargetEnv.ground_truth[merchant_name]
-        
-        # 50% chance to add a field, 50% to remove one (if more than 2)
+    def _drift_schema(self, provider_name: str) -> None:
+        """Mutate an existing schema to simulate API drift."""
+        schema = MovingTargetEnv.ground_truth[provider_name]
+
         if random.random() > 0.5 or len(schema["required_fields"]) <= 2:
-            # Add a field
-            new_field = random.choice([f for f in POTENTIAL_FIELDS if f not in schema["required_fields"]])
-            if new_field not in schema["required_fields"]:
-                schema["required_fields"].append(new_field)
+            # Add a new field
+            new_field = random.choice(
+                [f for f in POTENTIAL_FIELDS if f not in schema["required_fields"]]
+            )
+            schema["required_fields"].append(new_field)
         else:
-            # Remove a field (but never remove 'item')
-            removable = [f for f in schema["required_fields"] if f != "item"]
+            # Remove a field (never remove 'amount')
+            removable = [f for f in schema["required_fields"] if f != "amount"]
             if removable:
                 schema["required_fields"].remove(random.choice(removable))
-        
-        schema["api_version"] = f"v{random.randint(1, 9)}.{random.randint(0, 9)}-updated"
-        MovingTargetEnv.ground_truth[merchant_name] = schema
 
-    def _initialize_world(self):
-        """Spawns the initial world."""
+        schema["api_version"] = f"v{random.randint(1, 9)}.{random.randint(0, 9)}-updated"
+        # Fee and settlement can also drift
+        schema["transaction_fee"] = random.choice(["0.5%", "1%", "1.5%", "2%", "$1 flat", "$2 flat", "$3 flat"])
+        schema["settlement_time"] = random.choice(["instant", "same day", "1-2 days", "3-5 days"])
+        MovingTargetEnv.ground_truth[provider_name] = schema
+
+    def _initialize_world(self) -> None:
         MovingTargetEnv.ground_truth = {}
-        for m in self.initial_merchants:
-            MovingTargetEnv.ground_truth[m] = self._generate_random_schema()
+        for p in self.initial_providers:
+            MovingTargetEnv.ground_truth[p] = self._generate_random_schema()
+
+    # ── OpenEnv lifecycle ─────────────────────────────────────────────────────
 
     def reset(self, seed=None, episode_id=None, **kwargs):
-        """Standard OpenEnv reset method."""                 
         MovingTargetEnv._global_step_count = 0
         MovingTargetEnv._directory_rewarded = False
-        return MovingTargetObservation(
-            data="Environment Reset. A new chaotic world of shifting API schemas has been generated.",
+        return FintechObservation(
+            data="Environment reset. Fintech provider APIs are live — schemas may shift at any time.",
             status=200,
         )
 
-    def step(self, action: MovingTargetAction, **kwargs):
-        """Route the action to the appropriate tool."""
+    def step(self, action: FintechAction, **kwargs):
         MovingTargetEnv._global_step_count += 1
 
-        if action.tool == "get_merchants":
-            reward = 0
-            if not MovingTargetEnv._directory_rewarded: 
-                reward = 5.0
-                MovingTargetEnv._directory_rewarded = True
-            return MovingTargetObservation(
-                data=json.dumps(list(MovingTargetEnv.ground_truth.keys())),
-                status=200,
-                reward=reward
-            )
-
-        elif action.tool == "ask_watchdog":
-            return self._ask_watchdog(action.merchant_name)
-        
-        elif action.tool == "place_order":
-            return self._place_order(action.merchant_name, action.payload or {})
-            
+        if action.tool == "get_providers":
+            return self._get_providers()
+        elif action.tool == "check_provider":
+            return self._check_provider(action.provider_name)
+        elif action.tool == "execute_transaction":
+            return self._execute_transaction(action.provider_name, action.payload or {})
         else:
-            return MovingTargetObservation(
-                data=f"Unknown tool: '{action.tool}'.",
+            return FintechObservation(
+                data=f"Unknown tool: '{action.tool}'. Valid tools: get_providers, check_provider, execute_transaction.",
                 status=400,
-                reward=-5.0
+                reward=-3.0,
             )
 
-    # TOOL 1: The Scout
-    def _ask_watchdog(self, merchant_name: str) -> MovingTargetObservation:
-        """Check API docs and refund policies for a merchant. Causes drift!"""
-        
-        # If the agent invents a completely new merchant, "spawn" it natively
-        if merchant_name not in MovingTargetEnv.ground_truth:
-            MovingTargetEnv.ground_truth[merchant_name] = self._generate_random_schema()
-        else:
-            # If it already exists, there is a 30% chance the API shifts beneath their feet!
-            if random.random() < 0.30:
-                self._drift_schema(merchant_name)
+    # ── Tools ─────────────────────────────────────────────────────────────────
 
-        return MovingTargetObservation(
-            data=json.dumps(MovingTargetEnv.ground_truth[merchant_name]),
+    def _get_providers(self) -> FintechObservation:
+        """List available fintech providers. Rewarded only on first call."""
+        reward = 0.0
+        if not MovingTargetEnv._directory_rewarded:
+            reward = 3.0
+            MovingTargetEnv._directory_rewarded = True
+        return FintechObservation(
+            data=json.dumps(list(MovingTargetEnv.ground_truth.keys())),
             status=200,
-            reward=-2.0
+            reward=reward,
         )
 
-    # TOOL 2: The Executioner
-    def _place_order(self, merchant_name: str, payload: dict) -> MovingTargetObservation:
-        """Place the order. Fails if the payload doesn't match the current schema."""
-        if merchant_name not in MovingTargetEnv.ground_truth:
-            return MovingTargetObservation(
-                data="Merchant not found in directory. Use ask_watchdog first.", 
+    def _check_provider(self, provider_name: str) -> FintechObservation:
+        """Return provider API schema. Small positive reward to encourage probing.
+        
+        30% chance of schema drift after each check — APIs change in the wild.
+        """
+        if provider_name not in MovingTargetEnv.ground_truth:
+            MovingTargetEnv.ground_truth[provider_name] = self._generate_random_schema()
+        elif random.random() < 0.30:
+            self._drift_schema(provider_name)
+
+        return FintechObservation(
+            data=json.dumps(MovingTargetEnv.ground_truth[provider_name]),
+            status=200,
+            reward=1.0,   # positive: checking before acting is correct behaviour
+        )
+
+    def _execute_transaction(self, provider_name: str, payload: dict) -> FintechObservation:
+        """Execute a transaction. Validates payload against live schema."""
+        if provider_name not in MovingTargetEnv.ground_truth:
+            return FintechObservation(
+                data="Provider not found. Call get_providers then check_provider first.",
                 status=404,
-                reward=-20.0
+                reward=-10.0,
             )
 
-        real_rules = MovingTargetEnv.ground_truth[merchant_name]
+        schema = MovingTargetEnv.ground_truth[provider_name]
 
-        # Validate the agent's attempt against Ground Truth
-        for field in real_rules["required_fields"]:
+        # Missing required field
+        for field in schema["required_fields"]:
             if field not in payload:
-                return MovingTargetObservation(
-                    data=f"API REJECTED: Missing required field '{field}'. Schema may have drifted!",
+                return FintechObservation(
+                    data=f"API REJECTED: Missing required field '{field}'. Schema may have drifted — call check_provider again.",
                     status=400,
-                    reward=-50.0
-                )
-        
-        # Check for unexpected fields (Strict Server Validation)
-        for field in payload.keys():
-            if field not in real_rules["required_fields"]:
-                return MovingTargetObservation(
-                    data=f"API REJECTED: Unknown field '{field}' provided. Schema may have drifted!",
-                    status=400,
-                    reward=-50.0
+                    reward=-15.0,
                 )
 
-        # ENVIRONMENT JUDGE: Evaluate Business Logic Compliance
+        # Unexpected field (strict server validation)
+        for field in payload:
+            if field not in schema["required_fields"]:
+                return FintechObservation(
+                    data=f"API REJECTED: Unexpected field '{field}' in payload. Schema may have drifted — call check_provider again.",
+                    status=400,
+                    reward=-15.0,
+                )
+
+        # Business-logic judge via LLM
         if MovingTargetEnv.ground_truth_constraint:
             try:
                 evaluator = ChatOpenAI(
@@ -174,42 +185,46 @@ class MovingTargetEnv(Environment[MovingTargetAction, MovingTargetObservation, M
                     api_key=os.getenv("OPENROUTER_API_KEY"),
                 )
                 eval_prompt = f"""
-                You are the ultimate environment judge.
-                User's True Constraints: {MovingTargetEnv.ground_truth_constraint}
-                The Agent just placed an order with '{merchant_name}'. 
-                
-                The Merchant's actual data:
-                - Refund Policy: {real_rules.get("refund_policy", "Unknown")}
-                - Average Price for 1: {real_rules.get("average_price_for_1", "Unknown")}
-                - Other Policies (Pet-Friendly, Halal, etc.): {real_rules.get("other_policies", "Unknown")}
-                
-                The Agent's payload was: {payload}
+You are a fintech compliance judge.
 
-                Question: Making sure if the all dietary requirements are forwarded either in policies or notes or both ,Does this order violate the user's constraints regarding Refund Policy, Budget, or Diet/Special needs (like Pet-Friendly)?
-                Respond with EXACTLY 'YES' if it violates (even partially), or 'NO' if it matches perfectly.
-                """
-                eval_result = evaluator.invoke(eval_prompt)
-                if "YES" in eval_result.content.upper():
-                    return MovingTargetObservation(
-                        data="API Accepted, BUT ORDER VIOLATES USER CONSTRAINTS! Refund policies or dietary needs were ignored.",
+User's stated constraints: {MovingTargetEnv.ground_truth_constraint}
+
+The agent just executed a transaction via '{provider_name}'.
+
+Provider's actual terms:
+- Transaction Fee: {schema.get("transaction_fee", "Unknown")}
+- Supported Currencies: {schema.get("supported_currencies", "Unknown")}
+- KYC Required: {schema.get("kyc_required", "Unknown")}
+- Transfer Limit: {schema.get("transfer_limit", "Unknown")}
+- Settlement Time: {schema.get("settlement_time", "Unknown")}
+
+Agent's transaction payload: {payload}
+
+Question: Does this transaction violate the user's constraints regarding fee limits, 
+required currency, KYC level, transfer limits, or settlement time?
+Respond with EXACTLY 'YES' if it violates (even partially), or 'NO' if it satisfies all constraints.
+"""
+                result = evaluator.invoke(eval_prompt)
+                if "YES" in result.content.upper():
+                    return FintechObservation(
+                        data="Transaction API accepted, BUT VIOLATES USER CONSTRAINTS. Fee, currency, KYC, or settlement requirements were not met.",
                         status=400,
-                        reward=-100.0,
-                        done=True
+                        reward=-40.0,
+                        done=True,
                     )
             except Exception as e:
-                # Judge failure should not block the episode — log and continue
-                print(f"[Environment Judge Error] {e}")
+                print(f"[Judge Error] {e}")
 
-        return MovingTargetObservation(
-            data="Order successful! API Schema perfectly matched and constraints were met.", 
-            status=200, 
-            done=True, 
-            reward=50.0
+        return FintechObservation(
+            data="Transaction successful! Provider schema matched and all user constraints were satisfied.",
+            status=200,
+            reward=50.0,
+            done=True,
         )
 
     @property
-    def state(self) -> MovingTargetEnvironmentState:
-        return MovingTargetEnvironmentState(
+    def state(self) -> FintechEnvironmentState:
+        return FintechEnvironmentState(
             episode_id=None,
             step_count=MovingTargetEnv._global_step_count,
         )

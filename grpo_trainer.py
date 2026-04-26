@@ -17,7 +17,7 @@ from trl import GRPOConfig, GRPOTrainer
 from model_loader import get_model_and_tokenizer
 
 SERVER_URL = os.getenv("ENV_SERVER_URL", "http://localhost:8000/")
-ALLOWED_TOOLS = {"getMerchant", "ask_watchdog", "check_merchant", "place_order"}
+ALLOWED_TOOLS = {"getProviders", "check_provider", "execute_transaction"}
 
 
 # ── reward function ───────────────────────────────────────────────────────────
@@ -67,9 +67,9 @@ def _validate_tool_call(tool_call: dict | None) -> dict | None:
 def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
     """Score each generated completion by calling the running environment server.
 
-    getMerchant / ask_watchdog use fixed deterministic rewards (matching env).
-    place_order pre-loads the schema with ask_watchdog then calls place_order
-    so the environment judge can validate payload + constraints.
+    getProviders  → fixed +3.0 (stable discovery signal during training)
+    check_provider → fixed +1.0 (reward probing before acting)
+    execute_transaction → calls env (check_provider seed + execute) for full validation
     Plain-text completions (no tool call) receive 0.
     """
     rewards = []
@@ -80,29 +80,30 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
             continue
 
         tool = tool_call.get("tool", "")
-        merchant = tool_call.get("merchant_name", "unknown")
+        provider = tool_call.get("provider_name", "unknown")
 
         try:
-            if tool == "getMerchant":
-                # Fixed reward — mirrors env's first-call bonus but stable during training
+            if tool == "getProviders":
+                # Fixed reward — mirrors env's first-call bonus, stable during training
                 rewards.append(3.0)
 
-            elif tool == "ask_watchdog":
-                rewards.append(-2.0)
+            elif tool == "check_provider":
+                # Small positive reward: probing before acting is correct behaviour
+                rewards.append(1.0)
 
-            elif tool == "place_order":
-                # Pre-load the merchant schema so the server can validate the payload
+            elif tool == "execute_transaction":
+                # Seed provider schema first so the env can validate the payload
                 requests.post(
                     f"{SERVER_URL}step",
-                    json={"action": {"tool": "ask_watchdog", "merchant_name": merchant}},
+                    json={"action": {"tool": "check_provider", "provider_name": provider, "payload": {}}},
                     timeout=10,
                 )
                 resp = requests.post(
                     f"{SERVER_URL}step",
                     json={"action": {
-                        "tool": "place_order",
-                        "merchant_name": merchant,
-                        "payload": tool_call.get("payload") or {},
+                        "tool":          "execute_transaction",
+                        "provider_name": provider,
+                        "payload":       tool_call.get("payload") or {},
                     }},
                     timeout=10,
                 )
@@ -112,7 +113,7 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
                 rewards.append(r)
 
             else:
-                rewards.append(-1.0)
+                rewards.append(-3.0)
 
         except Exception as e:
             print(f"[REWARD] Error evaluating completion: {e}", flush=True)

@@ -4,10 +4,10 @@ dotenv.load_dotenv()
 
 from openenv.core.env_server import create_fastapi_app
 
-from models import MovingTargetAction, MovingTargetObservation
+from models import FintechAction, FintechObservation
 from server.Moving_Target_environment import MovingTargetEnv
 
-app = create_fastapi_app(MovingTargetEnv, MovingTargetAction, MovingTargetObservation)
+app = create_fastapi_app(MovingTargetEnv, FintechAction, FintechObservation)
 from pydantic import BaseModel
 
 class ConstraintPayload(BaseModel):
