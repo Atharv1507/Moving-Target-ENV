@@ -17,6 +17,7 @@ from trl import GRPOConfig, GRPOTrainer
 from model_loader import get_model_and_tokenizer
 
 SERVER_URL = os.getenv("ENV_SERVER_URL", "http://localhost:8000/")
+ALLOWED_TOOLS = {"getMerchant", "ask_watchdog", "check_merchant", "place_order"}
 
 
 # ── reward function ───────────────────────────────────────────────────────────
@@ -51,6 +52,18 @@ def _extract_reward(obs: dict, response_json: dict) -> float:
     return float(raw) if raw is not None else 0.0
 
 
+def _validate_tool_call(tool_call: dict | None) -> dict | None:
+    """Accept only well-formed, known tool calls."""
+    if tool_call is None or not isinstance(tool_call, dict):
+        return None
+    tool = tool_call.get("tool")
+    if not isinstance(tool, str):
+        return None
+    if tool not in ALLOWED_TOOLS:
+        return None
+    return tool_call
+
+
 def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
     """Score each generated completion by calling the running environment server.
 
@@ -61,7 +74,7 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
     """
     rewards = []
     for completion in completions:
-        tool_call = _parse_tool_call(completion)
+        tool_call = _validate_tool_call(_parse_tool_call(completion))
         if tool_call is None:
             rewards.append(0.0)
             continue
