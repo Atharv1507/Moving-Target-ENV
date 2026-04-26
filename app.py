@@ -252,11 +252,11 @@ def launch_gradio_ui() -> None:
         gr.Markdown("# Fintech Transaction Agent — GRPO Runner")
         gr.Markdown("Train the agent to execute payments/withdrawals via shifting fintech provider APIs. Click **Run 1 Cycle** to collect rollouts and run one GRPO update.")
         episodes = gr.Slider(
-            minimum=1,
-            maximum=20,
-            value=DEFAULT_EPISODES_PER_ROLLOUT,  # default 8
-            step=1,
-            label="Episodes per rollout",
+            minimum=30,
+            maximum=1000,
+            value=max(DEFAULT_EPISODES_PER_ROLLOUT, 30),
+            step=10,
+            label="Episodes per rollout (min 30)",
         )
         run_btn = gr.Button("Run 1 Cycle", variant="primary")
         output = gr.Textbox(label="Run status", lines=8)

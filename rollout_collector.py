@@ -29,35 +29,32 @@ FALLBACK_REQUESTS = [
 ]
 
 CONCIERGE_SYSTEM_PROMPT = (
-    "You are a fintech shopping assistant. You must follow this EXACT sequence:\n"
-    "1. Call getProviders to list available providers\n"
-    "2. Call check_provider with the user's requested provider name\n"
-    "3. If constraints are satisfied, call execute_transaction\n"
-    "Never call the same tool twice in a row.\n"
-    "Always use the provider name the user mentioned.\n\n"
-    "Available tools and their required JSON schemas:\n\n"
-    "1. getProviders — list all available payment providers\n"
-    '{"tool": "getProviders"}\n\n'
-    "2. check_provider — verify a specific provider meets constraints\n"
-    '{"tool": "check_provider", "provider_name": "<string>"}\n\n'
-    "3. execute_transaction — complete the purchase\n"
-    '{"tool": "execute_transaction", "provider_name": "<string>", "payload": {"amount": "<string>", "currency": "USD", "account_number": "<string>", "transaction_id": "<string>"}}\n\n'
-    "Rules:\n"
-    "- Only output valid JSON matching one of the above schemas\n"
-    "- Never call the same tool twice in a row\n"
-    "- Sequence: getProviders → check_provider → execute_transaction\n"
-    "- Use the provider name the user mentioned in check_provider\n"
-    "- The execute_transaction payload must contain EXACTLY the fields from check_provider's required_fields\n"
-    "- Invent any missing details (account numbers, IDs) — do NOT ask the user\n\n"
-    "EXAMPLE:\n"
-    'User: "Send $200 via Wise, fee under 2%"\n'
-    'You: {"tool": "getProviders"}\n'
-    'Tool result: ["Stripe", "Razorpay", "Wise"]\n'
-    'You: {"tool": "check_provider", "provider_name": "Wise"}\n'
-    'Tool result: {"required_fields": ["amount", "currency", "beneficiary_name"], "transaction_fee": "0.5%"}\n'
-    'You: {"tool": "execute_transaction", "provider_name": "Wise", "payload": {"amount": "200", "currency": "USD", "beneficiary_name": "Raj Kumar"}}\n'
-    'Tool result: Transaction successful.\n'
-    'You: Sent $200 via Wise at 0.5% fee.'
+    "You are a JSON-only tool-calling agent. "
+    "OUTPUT ONLY RAW JSON. NO text. NO explanation. NO markdown. NOTHING except a single JSON object.\n\n"
+    
+    "MANDATORY SEQUENCE — never deviate:\n"
+    "STEP 1: {\"tool\": \"getProviders\"}\n"
+    "STEP 2: {\"tool\": \"check_provider\", \"provider_name\": \"<user's provider>\"}\n"
+    "STEP 3: {\"tool\": \"execute_transaction\", \"provider_name\": \"<name>\", \"payload\": {<exact fields from check_provider result>}}\n\n"
+    
+    "STRICT RULES:\n"
+    "- Every single response must be ONLY a JSON object. If you output anything else you have failed.\n"
+    "- Never repeat the same tool twice in a row.\n"
+    "- Never skip steps. Never reorder steps.\n"
+    "- Step 3 payload must contain EXACTLY the fields listed in check_provider's required_fields. No more, no less.\n"
+    "- Invent values for any missing fields (account numbers, IDs, names). Never ask the user.\n"
+    "- If check_provider shows constraints are NOT met, output: {\"tool\": \"getProviders\"} and try next provider.\n\n"
+    
+    "EXAMPLE (follow this exactly):\n"
+    "User: Send $200 via Wise, fee under 2%\n"
+    "You: {\"tool\": \"getProviders\"}\n"
+    "Tool: [\"Stripe\", \"Wise\", \"Razorpay\"]\n"
+    "You: {\"tool\": \"check_provider\", \"provider_name\": \"Wise\"}\n"
+    "Tool: {\"fee\": \"0.5%\", \"settlement\": \"1-2 days\", \"required_fields\": [\"amount\", \"currency\", \"beneficiary_name\"]}\n"
+    "You: {\"tool\": \"execute_transaction\", \"provider_name\": \"Wise\", \"payload\": {\"amount\": \"200\", \"currency\": \"USD\", \"beneficiary_name\": \"Alex Smith\"}}\n"
+    "Tool: Transaction successful.\n\n"
+    
+    "VIOLATION = any response that is not a single valid JSON object. DO NOT VIOLATE."
 )
 
 # Model tool name → environment server tool name
@@ -88,6 +85,26 @@ def _build_prompt(messages: list[dict]) -> str:
     return text
 
 
+def _truncate_after_json(text: str) -> str:
+    """Truncate text after the first complete JSON object.
+
+    Prevents self-play hallucination where the model generates multi-turn
+    scripts like 'You: {"tool": ...}\nTool result: ...\nYou: {"tool": ...}'.
+    """
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[: i + 1]
+    return text
+
+
 def _generate(prompt: str, max_new_tokens: int = 256) -> str:
     """Run inference with the local model and return the new text only."""
     model, tokenizer = get_model_and_tokenizer()
@@ -96,12 +113,14 @@ def _generate(prompt: str, max_new_tokens: int = 256) -> str:
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=1.0,   # rollout-only: max diversity, fights entropy collapse
+            temperature=1.2,   # rollout-only: higher diversity, fights entropy collapse
             do_sample=True,
+            top_k=50,
             pad_token_id=tokenizer.eos_token_id,
         )
     new_ids = output_ids[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+    raw = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+    return _truncate_after_json(raw)
 
 
 def _parse_tool_call(text: str) -> dict | None:
@@ -345,6 +364,57 @@ def collect_rollouts(episodes: int, server_base_url: str, cycle: int = 1) -> lis
             tool_call, status = _validate_tool_call(raw_tool_call)
 
             if tool_call is None:
+                # ── Auto-inject execute_transaction if model dropped to text
+                # after a successful check_provider.  This lets the model
+                # experience the +50 reward signal it has never seen.
+                if (
+                    last_tool == "check_provider"
+                    and check_seen
+                    and provider_required_fields
+                ):
+                    # Pick the last checked provider
+                    inject_provider = list(check_seen)[-1]
+                    inject_fields = provider_required_fields.get(inject_provider, [])
+                    if inject_fields:
+                        inject_call = {
+                            "tool":          "execute_transaction",
+                            "provider_name": inject_provider,
+                            "payload":       _build_payload_from_required_fields(
+                                inject_fields, inject_provider, user_needs,
+                            ),
+                        }
+                        inject_completion = json.dumps(inject_call)
+                        inject_reward, inject_obs, inject_done = _execute_tool(
+                            inject_call, server_base_url,
+                        )
+                        episode_reward += inject_reward
+                        did_reach_execute = True
+                        print(
+                            f"[ROLLOUT]   step {step + 1}: model gave text after check_provider "
+                            f"→ auto-injected execute_transaction for {inject_provider!r}, "
+                            f"reward={inject_reward:.1f}",
+                            flush=True,
+                        )
+                        rollout_buffer.append({
+                            "prompt":     prompt,
+                            "completion": inject_completion,
+                            "reward":     inject_reward,
+                            "episode":    ep + 1,
+                            "tool":       "execute_transaction_auto",
+                            "done":       inject_done,
+                        })
+                        messages.append({"role": "assistant", "content": inject_completion})
+                        messages.append({"role": "user", "content": f"Tool result: {inject_obs}"})
+                        if inject_done:
+                            constraint_satisfied = inject_reward >= 50.0
+                            termination_reason = (
+                                "success" if constraint_satisfied else "constraint_violation"
+                            )
+                        # Don't break — let the episode continue if not done
+                        if inject_done:
+                            break
+                        continue
+
                 print(
                     f"[ROLLOUT]   step {step + 1}: invalid/no tool call ({status}) → episode end (reward 0)",
                     flush=True,
@@ -491,7 +561,9 @@ def collect_rollouts(episodes: int, server_base_url: str, cycle: int = 1) -> lis
                 messages.append({"role": "assistant", "content": completion})
                 messages.append({"role": "user", "content": f"Tool result: {obs_data}"})
                 retry_reward, retry_obs, retry_done = _execute_tool(retry_call, server_base_url)
-                episode_reward += retry_reward
+                # Cap retry penalty — don't double-punish for a single decision
+                capped_retry_reward = max(retry_reward, -5.0)
+                episode_reward += capped_retry_reward
                 done = True
                 print(
                     f"[ROLLOUT]   step {step + 1}: corrective retry reward={retry_reward:.1f}",
