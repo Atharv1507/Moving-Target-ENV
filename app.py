@@ -34,6 +34,34 @@ from model_loader import get_model_and_tokenizer
 from rollout_collector import collect_rollouts
 
 
+# ── stdout capture for live log viewer ────────────────────────────────────────
+
+import collections
+import io
+
+_LOG_LINES: collections.deque = collections.deque(maxlen=2000)
+
+
+class _TeeWriter(io.TextIOBase):
+    """Write to the original stream AND capture lines for the UI log viewer."""
+
+    def __init__(self, original: io.TextIOBase) -> None:
+        self._original = original
+
+    def write(self, s: str) -> int:
+        if s and s.strip():
+            for line in s.splitlines():
+                _LOG_LINES.append(line)
+        return self._original.write(s)
+
+    def flush(self) -> None:
+        self._original.flush()
+
+
+sys.stdout = _TeeWriter(sys.__stdout__)
+sys.stderr = _TeeWriter(sys.__stderr__)
+
+
 ENV_SERVER_PORT = int(os.getenv("ENV_SERVER_PORT", "8001"))
 SERVER_URL = f"http://localhost:{ENV_SERVER_PORT}/"
 DEFAULT_EPISODES_PER_ROLLOUT = int(os.getenv("EPISODES_PER_ROLLOUT", "8"))
@@ -244,29 +272,138 @@ def run_one_cycle(episodes_per_rollout: int = DEFAULT_EPISODES_PER_ROLLOUT) -> s
         _RUN_LOCK.release()
 
 
+def _read_live_log(tail: int = 200) -> str:
+    """Read the last `tail` lines from the captured log buffer."""
+    return "\n".join(_LOG_LINES[-tail:]) if _LOG_LINES else "(no logs yet)"
+
+
+def _read_metrics() -> str:
+    """Read metrics.jsonl and format as a readable table."""
+    output_dir = _resolve_output_dir()
+    metrics_path = os.path.join(output_dir, "metrics.jsonl")
+    if not os.path.exists(metrics_path):
+        return "(no metrics yet — run a training cycle first)"
+    lines = []
+    try:
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                m = json.loads(ln)
+                lines.append(
+                    f"Cycle {m.get('cycle', '?'):>2} │ "
+                    f"reward={m.get('avg_episode_reward', 0):.2f}  "
+                    f"success={m.get('success_rate', 0):.1%}  "
+                    f"invalid_tool={m.get('invalid_tool_rate', 0):.1%}  "
+                    f"samples={m.get('samples', 0)}  "
+                    f"severe_penalties={m.get('severe_penalty_count', 0)}"
+                )
+    except Exception as e:
+        return f"Error reading metrics: {e}"
+    return "\n".join(lines) if lines else "(no metrics yet)"
+
+
+def _read_training_csv() -> str:
+    """Read the latest training CSV and return its contents."""
+    log_dir = os.getenv("LOG_DIR", "logs")
+    if not os.path.isdir(log_dir):
+        return "(no training CSV logs found)"
+    csvs = sorted(
+        [f for f in os.listdir(log_dir) if f.startswith("training_") and f.endswith(".csv")],
+        reverse=True,
+    )
+    if not csvs:
+        return "(no training CSV logs found)"
+    csv_path = os.path.join(log_dir, csvs[0])
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        lines = content.strip().split("\n")
+        if len(lines) > 201:
+            return lines[0] + "\n... (showing last 200 rows) ...\n" + "\n".join(lines[-200:])
+        return content
+    except Exception as e:
+        return f"Error reading CSV: {e}"
+
+
 def launch_gradio_ui() -> None:
-    """Launch a minimal control panel to trigger one-cycle GRPO runs."""
+    """Launch the GRPO control panel with live logs for hackathon judges."""
     import gradio as gr
 
     with gr.Blocks(title="Fintech Transaction Agent — GRPO Runner") as demo:
-        gr.Markdown("# Fintech Transaction Agent — GRPO Runner")
-        gr.Markdown("Train the agent to execute payments/withdrawals via shifting fintech provider APIs. Click **Run 1 Cycle** to collect rollouts and run one GRPO update.")
-        episodes = gr.Slider(
-            minimum=30,
-            maximum=1000,
-            value=max(DEFAULT_EPISODES_PER_ROLLOUT, 30),
-            step=10,
-            label="Episodes per rollout (min 30)",
+        gr.Markdown("# 🏦 Fintech Transaction Agent — GRPO Runner")
+        gr.Markdown(
+            "Train a 1.5B-param LLM to autonomously execute fintech payments "
+            "via shifting provider APIs using GRPO reinforcement learning."
         )
-        run_btn = gr.Button("Run 1 Cycle", variant="primary")
-        output = gr.Textbox(label="Run status", lines=8)
 
-        run_btn.click(
-            fn=run_one_cycle,
-            inputs=[episodes],
-            outputs=[output],
-            queue=True,
-        )
+        with gr.Tabs():
+            # ── Tab 1: Training Control ────────────────────────────────────
+            with gr.Tab("🚀 Train"):
+                gr.Markdown("### Run a training cycle")
+                episodes = gr.Slider(
+                    minimum=30,
+                    maximum=1000,
+                    value=max(DEFAULT_EPISODES_PER_ROLLOUT, 30),
+                    step=10,
+                    label="Episodes per rollout (min 30)",
+                )
+                run_btn = gr.Button("Run 1 Cycle", variant="primary")
+                output = gr.Textbox(label="Run status", lines=8)
+                run_btn.click(
+                    fn=run_one_cycle,
+                    inputs=[episodes],
+                    outputs=[output],
+                    queue=True,
+                )
+
+            # ── Tab 2: Live Logs ───────────────────────────────────────────
+            with gr.Tab("📋 Live Logs"):
+                gr.Markdown(
+                    "### Live application logs\n"
+                    "Shows the last 200 lines of stdout. Click **Refresh** to update."
+                )
+                refresh_log_btn = gr.Button("🔄 Refresh Logs")
+                log_box = gr.Textbox(
+                    label="Application Logs (stdout)",
+                    lines=25,
+                    max_lines=30,
+                    value=_read_live_log,
+                    interactive=False,
+                )
+                refresh_log_btn.click(fn=_read_live_log, outputs=[log_box])
+
+            # ── Tab 3: Metrics ─────────────────────────────────────────────
+            with gr.Tab("📊 Metrics"):
+                gr.Markdown(
+                    "### Per-cycle training metrics\n"
+                    "Reads from `metrics.jsonl`. Click **Refresh** to see latest."
+                )
+                refresh_metrics_btn = gr.Button("🔄 Refresh Metrics")
+                metrics_box = gr.Textbox(
+                    label="Cycle Metrics",
+                    lines=15,
+                    value=_read_metrics,
+                    interactive=False,
+                )
+                refresh_metrics_btn.click(fn=_read_metrics, outputs=[metrics_box])
+
+            # ── Tab 4: Training CSV ────────────────────────────────────────
+            with gr.Tab("📄 Training CSV"):
+                gr.Markdown(
+                    "### Detailed training log (CSV)\n"
+                    "Per-episode and per-GRPO-step records. Click **Refresh** to update."
+                )
+                refresh_csv_btn = gr.Button("🔄 Refresh CSV")
+                csv_box = gr.Textbox(
+                    label="Training CSV (latest session)",
+                    lines=25,
+                    max_lines=30,
+                    value=_read_training_csv,
+                    interactive=False,
+                )
+                refresh_csv_btn.click(fn=_read_training_csv, outputs=[csv_box])
 
     print(f"[SYSTEM] Launching Gradio UI on 0.0.0.0:{DEFAULT_UI_PORT}", flush=True)
     demo.queue().launch(server_name="0.0.0.0", server_port=DEFAULT_UI_PORT)
