@@ -360,39 +360,72 @@ def launch_gradio_ui() -> None:
             "via shifting provider APIs using GRPO reinforcement learning."
         )
 
-        episodes = gr.Slider(
-            minimum=30,
-            maximum=1000,
-            value=max(DEFAULT_EPISODES_PER_ROLLOUT, 30),
-            step=10,
-            label="Episodes per rollout (min 30)",
-        )
-        run_btn = gr.Button("Run 1 Cycle", variant="primary")
-        output = gr.Textbox(label="Run status", lines=2)
+        with gr.Tabs():
+            # ── Tab 1: Training Control ────────────────────────────────────
+            with gr.Tab("🚀 Train"):
+                gr.Markdown("### Run a training cycle")
+                episodes = gr.Slider(
+                    minimum=30,
+                    maximum=1000,
+                    value=max(DEFAULT_EPISODES_PER_ROLLOUT, 30),
+                    step=10,
+                    label="Episodes per rollout (min 30)",
+                )
+                run_btn = gr.Button("Run 1 Cycle", variant="primary")
+                output = gr.Textbox(label="Run status", lines=8)
+                run_btn.click(
+                    fn=run_one_cycle,
+                    inputs=[episodes],
+                    outputs=[output],
+                    queue=True,
+                )
 
-        gr.Markdown("### Live Application Logs")
-        log_box = gr.Textbox(
-            label="stdout/stderr",
-            lines=25,
-            max_lines=30,
-            value=_read_live_log,
-            interactive=False,
-        )
+            # ── Tab 2: Live Logs ───────────────────────────────────────────
+            with gr.Tab("📋 Live Logs"):
+                gr.Markdown(
+                    "### Live application logs\n"
+                    "Shows the last 200 lines of stdout. Click **Refresh** to update."
+                )
+                refresh_log_btn = gr.Button("🔄 Refresh Logs")
+                log_box = gr.Textbox(
+                    label="Application Logs (stdout)",
+                    lines=25,
+                    max_lines=30,
+                    value=_read_live_log,
+                    interactive=False,
+                )
+                refresh_log_btn.click(fn=_read_live_log, outputs=[log_box])
 
-        run_btn.click(
-            fn=run_one_cycle,
-            inputs=[episodes],
-            outputs=[output],
-            queue=True,
-        )
+            # ── Tab 3: Metrics ─────────────────────────────────────────────
+            with gr.Tab("📊 Metrics"):
+                gr.Markdown(
+                    "### Per-cycle training metrics\n"
+                    "Reads from `metrics.jsonl`. Click **Refresh** to see latest."
+                )
+                refresh_metrics_btn = gr.Button("🔄 Refresh Metrics")
+                metrics_box = gr.Textbox(
+                    label="Cycle Metrics",
+                    lines=15,
+                    value=_read_metrics,
+                    interactive=False,
+                )
+                refresh_metrics_btn.click(fn=_read_metrics, outputs=[metrics_box])
 
-        # Auto-refresh the log box every 1 second
-        demo.load(
-            fn=_read_live_log,
-            inputs=None,
-            outputs=[log_box],
-            every=1,
-        )
+            # ── Tab 4: Training CSV ────────────────────────────────────────
+            with gr.Tab("📄 Training CSV"):
+                gr.Markdown(
+                    "### Detailed training log (CSV)\n"
+                    "Per-episode and per-GRPO-step records. Click **Refresh** to update."
+                )
+                refresh_csv_btn = gr.Button("🔄 Refresh CSV")
+                csv_box = gr.Textbox(
+                    label="Training CSV (latest session)",
+                    lines=25,
+                    max_lines=30,
+                    value=_read_training_csv,
+                    interactive=False,
+                )
+                refresh_csv_btn.click(fn=_read_training_csv, outputs=[csv_box])
 
     print(f"[SYSTEM] Launching Gradio UI on 0.0.0.0:{DEFAULT_UI_PORT}", flush=True)
     demo.queue().launch(server_name="0.0.0.0", server_port=DEFAULT_UI_PORT)
