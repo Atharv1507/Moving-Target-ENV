@@ -262,7 +262,7 @@ def launch_gradio_ui() -> None:
         )
 
     print(f"[SYSTEM] Launching Gradio UI on 0.0.0.0:{DEFAULT_UI_PORT}", flush=True)
-    demo.queue().launch(server_name="0.0.0.0", server_port=DEFAULT_UI_PORT, root_path="")
+    demo.queue().launch(server_name="0.0.0.0", server_port=DEFAULT_UI_PORT)
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
