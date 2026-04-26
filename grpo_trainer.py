@@ -1,5 +1,9 @@
 """GRPO training using TRL + Unsloth."""
-import unsloth  # noqa: F401 — must be first import
+# Import unsloth FIRST — must precede trl/transformers to apply patches.
+try:
+    import unsloth  # noqa: F401
+except (ImportError, Exception):
+    pass
 
 import json
 import math

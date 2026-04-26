@@ -9,7 +9,12 @@ Environment variables:
   EPISODES_PER_ROLLOUT  Episodes per training cycle (default: 5)
   TRAINING_CYCLES       Number of collect → train cycles (default: 3)
 """
-import unsloth  # noqa: F401 — must be first import
+# Import unsloth FIRST — must precede trl/transformers to apply patches.
+# Guarded because unsloth_zoo may be incompatible with the installed TRL version.
+try:
+    import unsloth  # noqa: F401
+except (ImportError, Exception):
+    pass
 
 import atexit
 import json

@@ -1,5 +1,9 @@
 """Runs episodes with the local model as a fintech payment agent and collects training data."""
-import unsloth  # noqa: F401 — must be first import
+# Import unsloth FIRST — must precede trl/transformers to apply patches.
+try:
+    import unsloth  # noqa: F401
+except (ImportError, Exception):
+    pass
 
 import json
 import os

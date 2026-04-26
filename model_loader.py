@@ -3,7 +3,11 @@
 Uses Unsloth on CUDA (HuggingFace Space T4) when compatible.
 Falls back to standard HuggingFace + PEFT on CPU/MPS or on version mismatch.
 """
-import unsloth  # noqa: F401 — must be first import
+# Import unsloth FIRST — must precede trl/transformers to apply patches.
+try:
+    import unsloth  # noqa: F401
+except (ImportError, Exception):
+    pass
 
 import os
 import torch
