@@ -37,6 +37,7 @@ CONCIERGE_SYSTEM_PROMPT = (
     "TOOL FORMAT — output EXACTLY one of these JSON objects, nothing else:\n"
     '- List merchants:  {"tool": "getMerchant"}\n'
     '- Check merchant:  {"tool": "ask_watchdog", "merchant_name": "NAME"}\n'
+    '-Make sure to ask only one merchant at a time'
     '- Place order:     {"tool": "place_order", "merchant_name": "NAME", "payload": {"field": "value"}}\n\n'
     "RULES:\n"
     "1. Always call getMerchant first to discover available merchants.\n"
@@ -57,6 +58,7 @@ CONCIERGE_SYSTEM_PROMPT = (
     'You: Order placed at HalalKitchen for $35.\n\n'
     "REMEMBER: Every response is a JSON tool call UNTIL the order succeeds.\n"
     "NO PROSE. NO LISTS. NO EXPLANATIONS. JSON ONLY."
+    "After place_order succeeds, write plain text only. DO NOT wrap the summary in JSON or curly braces."
 )
 
 # Model tool name → environment server tool name
