@@ -42,10 +42,14 @@ import io
 _LOG_LINES: collections.deque = collections.deque(maxlen=2000)
 
 
-class _TeeWriter(io.TextIOBase):
-    """Write to the original stream AND capture lines for the UI log viewer."""
+class _TeeWriter:
+    """Write to the original stream AND capture lines for the UI log viewer.
 
-    def __init__(self, original: io.TextIOBase) -> None:
+    Delegates all stream methods (fileno, isatty, etc.) to the original so
+    subprocess, uvicorn, and other libs that need a real fd keep working.
+    """
+
+    def __init__(self, original) -> None:
         self._original = original
 
     def write(self, s: str) -> int:
@@ -56,6 +60,24 @@ class _TeeWriter(io.TextIOBase):
 
     def flush(self) -> None:
         self._original.flush()
+
+    def fileno(self) -> int:
+        return self._original.fileno()
+
+    def isatty(self) -> bool:
+        return self._original.isatty()
+
+    @property
+    def encoding(self):
+        return getattr(self._original, "encoding", "utf-8")
+
+    @property
+    def errors(self):
+        return getattr(self._original, "errors", "strict")
+
+    def __getattr__(self, name):
+        # Delegate anything else (readable, writable, seekable, etc.)
+        return getattr(self._original, name)
 
 
 sys.stdout = _TeeWriter(sys.__stdout__)
