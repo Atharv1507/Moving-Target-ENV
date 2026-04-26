@@ -436,6 +436,11 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
                 obs_data = retry_obs
 
             messages.append({"role": "assistant", "content": completion})
+
+            # hint the model after getMerchant
+            if tool_call.get("tool") == "getMerchant":
+                obs_data = f"{obs_data}\nNext: call ask_watchdog for the specific merchant the user mentioned."
+
             messages.append({"role": "user", "content": f"[Tool Result]: {obs_data}"})
 
             if done:
