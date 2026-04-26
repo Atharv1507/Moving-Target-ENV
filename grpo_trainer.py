@@ -6,16 +6,22 @@ except ImportError:
     pass
 
 import json
+import math
 import os
 
 import requests
 import torch
+import torch.nn.functional as F
 from datasets import Dataset
 from trl import GRPOConfig, GRPOTrainer
 from transformers import TrainerCallback
 
 from model_loader import get_model_and_tokenizer
 from training_logger import log_step, log_cycle
+
+# Entropy regularisation coefficient — added directly to reward since
+# GRPOConfig.entropy_coef does not exist in any released TRL version.
+ENTROPY_COEF = 0.01
 
 SERVER_URL = os.getenv("ENV_SERVER_URL", "http://localhost:8001/")
 ALLOWED_TOOLS = {"getProviders", "check_provider", "execute_transaction"}
@@ -59,6 +65,31 @@ def _validate_tool_call(tool_call: dict | None) -> dict | None:
     return tool_call
 
 
+def _completion_entropy_bonus(completion: str) -> float:
+    """Compute a small entropy bonus from the token distribution of a completion.
+
+    Uses the model to score the completion and returns ENTROPY_COEF * H(p),
+    where H(p) is the mean per-token entropy. Encourages the model to maintain
+    action diversity without relying on the non-existent GRPOConfig.entropy_coef.
+    Returns 0.0 safely if the model is unavailable or inference fails.
+    """
+    if ENTROPY_COEF == 0.0 or not completion.strip():
+        return 0.0
+    try:
+        model, tokenizer = get_model_and_tokenizer()
+        inputs = tokenizer(completion, return_tensors="pt", truncation=True, max_length=256)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            logits = model(**inputs).logits  # (1, seq_len, vocab)
+        probs = F.softmax(logits[0], dim=-1)          # (seq_len, vocab)
+        # Per-token entropy: -sum(p * log(p))
+        log_probs = torch.log(probs.clamp(min=1e-9))
+        entropy = -(probs * log_probs).sum(dim=-1).mean().item()  # scalar
+        return ENTROPY_COEF * entropy
+    except Exception:
+        return 0.0
+
+
 def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
     """Score each generated completion by calling the running environment server.
 
@@ -71,20 +102,20 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
       constraint violation           → -40.0 (from env)
       unknown / no tool              → 0.0
       execute before check_provider  → -20.0 (safety gate)
+      entropy bonus                  → ENTROPY_COEF * H(completion tokens)
 
     Zero-std groups: if all completions in the batch share the same reward,
     the group contributes no gradient — return uniform rewards so GRPO skips it.
     """
     rewards = []
-    # Track whether check_provider has been called within this batch pass
-    # (proxy for within-episode ordering; true per-episode gate is in rollout_collector)
     check_seen: set[str] = set()
     providers_listed = False
 
     for completion in completions:
+        h_bonus = _completion_entropy_bonus(completion)
         tool_call = _validate_tool_call(_parse_tool_call(completion))
         if tool_call is None:
-            rewards.append(0.0)
+            rewards.append(0.0 + h_bonus)
             continue
 
         tool = tool_call.get("tool", "")
@@ -92,23 +123,19 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
 
         try:
             if tool == "getProviders":
-                if not providers_listed:
-                    providers_listed = True
-                    rewards.append(3.0)
-                else:
-                    rewards.append(0.0)
+                base = 3.0 if not providers_listed else 0.0
+                providers_listed = True
+                rewards.append(base + h_bonus)
 
             elif tool == "check_provider":
                 check_seen.add(provider)
-                rewards.append(1.0)
+                rewards.append(1.0 + h_bonus)
 
             elif tool == "execute_transaction":
-                # Safety gate: penalise execute before any check_provider
                 if provider not in check_seen:
-                    rewards.append(-20.0)
+                    rewards.append(-20.0 + h_bonus)
                     continue
 
-                # Seed provider schema so env can validate payload
                 requests.post(
                     f"{SERVER_URL}step",
                     json={"action": {"tool": "check_provider", "provider_name": provider, "payload": {}}},
@@ -125,18 +152,16 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
                 )
                 payload = resp.json()
                 obs = payload.get("observation", {})
-                rewards.append(_extract_reward(obs, payload))
+                rewards.append(_extract_reward(obs, payload) + h_bonus)
 
             else:
-                rewards.append(-3.0)
+                rewards.append(-3.0 + h_bonus)
 
         except Exception as e:
             print(f"[REWARD] Error evaluating completion: {e}", flush=True)
             rewards.append(-5.0)
 
-    # Zero-std guard: if every reward in the group is identical, GRPO would
-    # divide by zero std. Return as-is — TRL's frac_reward_zero_std metric
-    # already tracks this; groups with zero std are excluded from loss internally.
+    # Zero-std guard: return as-is; TRL excludes zero-std groups from loss.
     return rewards
 
 
@@ -231,8 +256,6 @@ def train_with_grpo(
         num_generations=8,
         max_completion_length=256,
         temperature=0.9,
-        # Entropy regularisation — prevents collapse to single safe action
-        entropy_coef=0.01,
         # Optimiser
         learning_rate=1e-5,
         bf16=use_bf16,
