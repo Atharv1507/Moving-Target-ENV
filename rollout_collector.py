@@ -38,13 +38,14 @@ CONCIERGE_SYSTEM_PROMPT = (
     "STEP 3: {\"tool\": \"execute_transaction\", \"provider_name\": \"<name>\", \"payload\": {<exact fields from check_provider result>}}\n\n"
     
     "STRICT RULES:\n"
+    "-After check_provider responds, extract the required_fields array from its result.Your execute_transaction payload must use ONLY those exact field names.DO NOT use: ifsc_code, swift_code, sender_name, routing_number, or any fieldnot listed in required_fields."
     "- Every single response must be ONLY a JSON object. If you output anything else you have failed.\n"
     "- Never repeat the same tool twice in a row.\n"
     "- Never skip steps. Never reorder steps.\n"
     "- Step 3 payload must contain EXACTLY the fields listed in check_provider's required_fields. No more, no less.\n"
     "- Invent values for any missing fields (account numbers, IDs, names). Never ask the user.\n"
     "- If check_provider shows constraints are NOT met, output: {\"tool\": \"getProviders\"} and try next provider.\n\n"
-    
+    "- NEVER use imaginary tools , work ONLY with the 3 given ones"
     "EXAMPLE (follow this exactly):\n"
     "User: Send $200 via Wise, fee under 2%\n"
     "You: {\"tool\": \"getProviders\"}\n"
@@ -53,7 +54,7 @@ CONCIERGE_SYSTEM_PROMPT = (
     "Tool: {\"fee\": \"0.5%\", \"settlement\": \"1-2 days\", \"required_fields\": [\"amount\", \"currency\", \"beneficiary_name\"]}\n"
     "You: {\"tool\": \"execute_transaction\", \"provider_name\": \"Wise\", \"payload\": {\"amount\": \"200\", \"currency\": \"USD\", \"beneficiary_name\": \"Alex Smith\"}}\n"
     "Tool: Transaction successful.\n\n"
-    
+    "Reward = 50"
     "VIOLATION = any response that is not a single valid JSON object. DO NOT VIOLATE."
 )
 
