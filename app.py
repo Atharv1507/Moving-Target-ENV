@@ -35,7 +35,7 @@ from rollout_collector import collect_rollouts
 
 ENV_SERVER_PORT = int(os.getenv("ENV_SERVER_PORT", "8001"))
 SERVER_URL = f"http://localhost:{ENV_SERVER_PORT}/"
-DEFAULT_EPISODES_PER_ROLLOUT = int(os.getenv("EPISODES_PER_ROLLOUT", "5"))
+DEFAULT_EPISODES_PER_ROLLOUT = int(os.getenv("EPISODES_PER_ROLLOUT", "8"))
 DEFAULT_TRAINING_CYCLES = int(os.getenv("TRAINING_CYCLES", "3"))
 # Space/OpenEnv route this app on port 8000 by default.
 # Keep it overridable, but do not default to 7860 in deployment.
@@ -119,8 +119,8 @@ def _configure_training_logs() -> None:
     print("[SYSTEM] HF_LOG_TRAINING=1: verbose library logs enabled.", flush=True)
 
 
-def _append_cycle_metrics(output_dir: str, cycle_idx: int, rollout_buffer: list[dict]) -> None:
-    """Append cycle metrics to output_dir/metrics.jsonl."""
+def _append_cycle_metrics(output_dir: str, cycle_idx: int, rollout_buffer: list[dict]) -> dict:
+    """Append cycle metrics to output_dir/metrics.jsonl and return the metrics dict."""
     os.makedirs(output_dir, exist_ok=True)
     metrics_path = os.path.join(output_dir, "metrics.jsonl")
 
@@ -163,6 +163,7 @@ def _append_cycle_metrics(output_dir: str, cycle_idx: int, rollout_buffer: list[
         f"invalid_tool_rate={metrics['invalid_tool_rate']:.2%}",
         flush=True,
     )
+    return metrics
 
 
 # ── training loop ─────────────────────────────────────────────────────────────
@@ -179,33 +180,31 @@ def run_training_loop(
     # Load the model once — rollout_collector and grpo_trainer both share this cache
     get_model_and_tokenizer()
 
-    # Collect all rollouts first, then do one GRPO pass.
-    # Re-instantiating GRPOTrainer per cycle risks OOM on 16 GB from re-building the ref model.
-    all_rollouts: list = []
-
     for cycle in range(cycles):
-        print(f"\n[TRAINING] ── Cycle {cycle + 1}/{cycles}: collecting rollouts ──", flush=True)
+        cycle_num = cycle + 1
+        print(f"\n[TRAINING] ── Cycle {cycle_num}/{cycles}: collecting rollouts ──", flush=True)
         rollout_buffer = collect_rollouts(
             episodes=episodes_per_rollout,
             server_base_url=SERVER_URL,
+            cycle=cycle_num,
         )
         for i, item in enumerate(rollout_buffer, 1):
             print(f"[TRAINING]   sample {i}/{len(rollout_buffer)} reward={item['reward']:.1f}", flush=True)
-        all_rollouts.extend(rollout_buffer)
-        _append_cycle_metrics(output_dir, cycle, rollout_buffer)
 
-    n = len(all_rollouts)
-    # Conservative step count for T4: enough to learn but won't OOM or time out
-    grpo_steps = min(max(8, 2 * n), 40)
-    print(f"\n[TRAINING] ── GRPO update: {n} samples, {grpo_steps} steps ──", flush=True)
+        cycle_metrics = _append_cycle_metrics(output_dir, cycle, rollout_buffer)
 
-    train_with_grpo(
-        rollout_buffer=all_rollouts,
-        output_dir=output_dir,
-        max_steps=grpo_steps,
-    )
-    print("[TRAINING] GRPO update complete.", flush=True)
-    print(f"[TRAINING] Final adapter saved to: {output_dir}/final-adapter", flush=True)
+        n = len(rollout_buffer)
+        grpo_steps = min(max(8, 2 * n), 40)
+        print(f"\n[TRAINING] ── Cycle {cycle_num} GRPO update: {n} samples, {grpo_steps} steps ──", flush=True)
+
+        train_with_grpo(
+            rollout_buffer=rollout_buffer,
+            output_dir=output_dir,
+            max_steps=grpo_steps,
+            cycle=cycle_num,
+            cycle_metrics=cycle_metrics,
+        )
+        print(f"[TRAINING] Cycle {cycle_num} complete.", flush=True)
 
 
 def run_one_cycle(episodes_per_rollout: int = DEFAULT_EPISODES_PER_ROLLOUT) -> str:
@@ -247,7 +246,7 @@ def launch_gradio_ui() -> None:
         episodes = gr.Slider(
             minimum=1,
             maximum=20,
-            value=DEFAULT_EPISODES_PER_ROLLOUT,
+            value=DEFAULT_EPISODES_PER_ROLLOUT,  # default 8
             step=1,
             label="Episodes per rollout",
         )

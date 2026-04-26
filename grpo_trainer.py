@@ -7,27 +7,24 @@ except ImportError:
 
 import json
 import os
-import re
 
 import requests
 import torch
 from datasets import Dataset
 from trl import GRPOConfig, GRPOTrainer
+from transformers import TrainerCallback
 
 from model_loader import get_model_and_tokenizer
+from training_logger import log_step, log_cycle
 
-SERVER_URL = os.getenv("ENV_SERVER_URL", "http://localhost:8000/")
+SERVER_URL = os.getenv("ENV_SERVER_URL", "http://localhost:8001/")
 ALLOWED_TOOLS = {"getProviders", "check_provider", "execute_transaction"}
 
 
 # ── reward function ───────────────────────────────────────────────────────────
 
 def _parse_tool_call(text: str) -> dict | None:
-    """Extract the first balanced JSON object from text.
-
-    Handles nested dicts (place_order payloads) by counting braces instead
-    of using a flat regex that can't match past the first closing brace.
-    """
+    """Extract the first balanced JSON object from text."""
     start = text.find("{")
     if start == -1:
         return None
@@ -57,9 +54,7 @@ def _validate_tool_call(tool_call: dict | None) -> dict | None:
     if tool_call is None or not isinstance(tool_call, dict):
         return None
     tool = tool_call.get("tool")
-    if not isinstance(tool, str):
-        return None
-    if tool not in ALLOWED_TOOLS:
+    if not isinstance(tool, str) or tool not in ALLOWED_TOOLS:
         return None
     return tool_call
 
@@ -67,12 +62,25 @@ def _validate_tool_call(tool_call: dict | None) -> dict | None:
 def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
     """Score each generated completion by calling the running environment server.
 
-    getProviders  → fixed +3.0 (stable discovery signal during training)
-    check_provider → fixed +1.0 (reward probing before acting)
-    execute_transaction → calls env (check_provider seed + execute) for full validation
-    Plain-text completions (no tool call) receive 0.
+    Reward table (matches env exactly):
+      getProviders (first call)      → +3.0  (fixed, stable during training)
+      getProviders (repeat)          → 0.0
+      check_provider                 → +1.0  (encourage probing before acting)
+      execute_transaction success    → +50.0 (from env)
+      execute_transaction bad field  → -15.0 (from env)
+      constraint violation           → -40.0 (from env)
+      unknown / no tool              → 0.0
+      execute before check_provider  → -20.0 (safety gate)
+
+    Zero-std groups: if all completions in the batch share the same reward,
+    the group contributes no gradient — return uniform rewards so GRPO skips it.
     """
     rewards = []
+    # Track whether check_provider has been called within this batch pass
+    # (proxy for within-episode ordering; true per-episode gate is in rollout_collector)
+    check_seen: set[str] = set()
+    providers_listed = False
+
     for completion in completions:
         tool_call = _validate_tool_call(_parse_tool_call(completion))
         if tool_call is None:
@@ -84,15 +92,23 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
 
         try:
             if tool == "getProviders":
-                # Fixed reward — mirrors env's first-call bonus, stable during training
-                rewards.append(3.0)
+                if not providers_listed:
+                    providers_listed = True
+                    rewards.append(3.0)
+                else:
+                    rewards.append(0.0)
 
             elif tool == "check_provider":
-                # Small positive reward: probing before acting is correct behaviour
+                check_seen.add(provider)
                 rewards.append(1.0)
 
             elif tool == "execute_transaction":
-                # Seed provider schema first so the env can validate the payload
+                # Safety gate: penalise execute before any check_provider
+                if provider not in check_seen:
+                    rewards.append(-20.0)
+                    continue
+
+                # Seed provider schema so env can validate payload
                 requests.post(
                     f"{SERVER_URL}step",
                     json={"action": {"tool": "check_provider", "provider_name": provider, "payload": {}}},
@@ -109,8 +125,7 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
                 )
                 payload = resp.json()
                 obs = payload.get("observation", {})
-                r = _extract_reward(obs, payload)
-                rewards.append(r)
+                rewards.append(_extract_reward(obs, payload))
 
             else:
                 rewards.append(-3.0)
@@ -119,7 +134,65 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
             print(f"[REWARD] Error evaluating completion: {e}", flush=True)
             rewards.append(-5.0)
 
+    # Zero-std guard: if every reward in the group is identical, GRPO would
+    # divide by zero std. Return as-is — TRL's frac_reward_zero_std metric
+    # already tracks this; groups with zero std are excluded from loss internally.
     return rewards
+
+
+# ── logging callback ──────────────────────────────────────────────────────────
+
+class _StepLoggerCallback(TrainerCallback):
+    """Logs per-GRPO-step metrics via training_logger.log_step."""
+
+    def __init__(self, cycle: int) -> None:
+        self.cycle = cycle
+        self._step_rewards: list[float] = []
+        self._step_stds: list[float] = []
+        self._grad_norms: list[float] = []
+        self._entropies: list[float] = []
+        self._zero_std_count = 0
+        self._total_groups = 0
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return
+        step      = state.global_step
+        loss      = float(logs.get("loss", 0.0))
+        grad_norm = float(logs.get("grad_norm", 0.0))
+        entropy   = float(logs.get("entropy", 0.0))
+        lr        = float(logs.get("learning_rate", 0.0))
+        r_mean    = float(logs.get("reward_mean", logs.get("rewards/mean", 0.0)))
+        r_std     = float(logs.get("reward_std",  logs.get("rewards/std",  0.0)))
+        zero_std  = float(logs.get("frac_reward_zero_std", 0.0))
+
+        self._grad_norms.append(grad_norm)
+        self._entropies.append(entropy)
+        self._step_rewards.append(r_mean)
+        self._step_stds.append(r_std)
+        if zero_std > 0:
+            self._zero_std_count += 1
+        self._total_groups += 1
+
+        log_step(
+            cycle=self.cycle,
+            grpo_step=step,
+            loss=loss,
+            grad_norm=grad_norm,
+            entropy=entropy,
+            learning_rate=lr,
+            reward_mean=r_mean,
+            reward_std=r_std,
+        )
+
+    def cycle_summary(self) -> dict:
+        def _avg(lst): return sum(lst) / len(lst) if lst else 0.0
+        return {
+            "grad_norm_avg": _avg(self._grad_norms),
+            "entropy":       _avg(self._entropies),
+            "reward_std":    _avg(self._step_stds),
+            "frac_zero_std": self._zero_std_count / max(self._total_groups, 1),
+        }
 
 
 # ── main public function ──────────────────────────────────────────────────────
@@ -127,43 +200,50 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
 def train_with_grpo(
     rollout_buffer: list[dict],
     output_dir: str = "grpo-output",
-    max_steps: int = 20,
+    max_steps: int = 40,
+    cycle: int = 1,
+    cycle_metrics: dict | None = None,
 ) -> None:
     """Run GRPO training on data collected from collect_rollouts().
 
     Args:
         rollout_buffer: List of {"prompt": str, "completion": str, "reward": float}.
-        output_dir: Directory to save the final LoRA adapter.
-        max_steps: Number of GRPO update steps to run.
+        output_dir:     Directory to save LoRA adapter checkpoints.
+        max_steps:      Number of GRPO update steps.
+        cycle:          Current cycle index (1-based), used for logging.
+        cycle_metrics:  Pre-computed rollout metrics dict for the cycle summary.
     """
     model, tokenizer = get_model_and_tokenizer()
 
-    # Build dataset — only the prompt column is required by GRPOTrainer
     dataset = Dataset.from_list([{"prompt": r["prompt"]} for r in rollout_buffer])
 
-    is_cuda = torch.cuda.is_available()
+    is_cuda  = torch.cuda.is_available()
     use_bf16 = is_cuda and torch.cuda.is_bf16_supported()
     use_fp16 = is_cuda and not use_bf16
 
     config = GRPOConfig(
         output_dir=output_dir,
         max_steps=max_steps,
-        # Batch / gradient settings conservative for T4 16 GB
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        # Generation: 4 completions per prompt, up to 256 new tokens each
-        num_generations=4,
+        # Batch / gradient — T4 16 GB safe
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=2,
+        # Generation: 8 completions for diversity, higher temp for exploration
+        num_generations=8,
         max_completion_length=256,
-        temperature=0.7,
+        temperature=0.9,
+        # Entropy regularisation — prevents collapse to single safe action
+        entropy_coef=0.01,
         # Optimiser
-        learning_rate=2e-5,
+        learning_rate=1e-5,
         bf16=use_bf16,
         fp16=use_fp16,
-        # No external tracking by default
+        # Log every step
+        logging_steps=1,
         report_to="none",
-        # Save a checkpoint at the end
         save_strategy="no",
     )
+
+    cb = _StepLoggerCallback(cycle=cycle)
 
     trainer = GRPOTrainer(
         model=model,
@@ -171,13 +251,34 @@ def train_with_grpo(
         args=config,
         train_dataset=dataset,
         processing_class=tokenizer,
+        callbacks=[cb],
     )
 
-    print(f"[GRPO] Starting training: {len(dataset)} prompts, {max_steps} steps.", flush=True)
+    print(f"[GRPO] Cycle {cycle} — starting: {len(dataset)} prompts, {max_steps} steps.", flush=True)
     trainer.train()
 
-    # Save the fine-tuned LoRA adapter
-    adapter_path = os.path.join(output_dir, "final-adapter")
-    model.save_pretrained(adapter_path)
-    tokenizer.save_pretrained(adapter_path)
-    print(f"[GRPO] Adapter saved to {adapter_path}", flush=True)
+    # Per-cycle summary via logger
+    summary = cb.cycle_summary()
+    m = cycle_metrics or {}
+    log_cycle(
+        cycle=cycle,
+        avg_reward=m.get("avg_episode_reward", 0.0),
+        success_rate=m.get("success_rate", 0.0),
+        invalid_tool_rate=m.get("invalid_tool_rate", 0.0),
+        entropy=summary["entropy"],
+        grad_norm_avg=summary["grad_norm_avg"],
+        reward_std=summary["reward_std"],
+        frac_zero_std=summary["frac_zero_std"],
+    )
+
+    # Save adapter checkpoint for this cycle
+    cycle_adapter_path = os.path.join(output_dir, f"adapter-cycle-{cycle}")
+    model.save_pretrained(cycle_adapter_path)
+    tokenizer.save_pretrained(cycle_adapter_path)
+    print(f"[GRPO] Cycle {cycle} adapter saved to {cycle_adapter_path}", flush=True)
+
+    # Always overwrite the canonical final-adapter too
+    final_path = os.path.join(output_dir, "final-adapter")
+    model.save_pretrained(final_path)
+    tokenizer.save_pretrained(final_path)
+    print(f"[GRPO] Final adapter updated at {final_path}", flush=True)

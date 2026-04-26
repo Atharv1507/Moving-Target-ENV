@@ -14,8 +14,9 @@ import requests
 import torch
 
 from model_loader import get_model_and_tokenizer
+from training_logger import log_episode
 
-MAX_STEPS_PER_EPISODE = 15
+MAX_STEPS_PER_EPISODE = 8  # cap early — cuts wasted loops, faster cycles
 
 FALLBACK_REQUESTS = [
     "I need to send $200 to India via UPI. The fee must be under 2% and I want same-day settlement.",
@@ -95,7 +96,7 @@ def _generate(prompt: str, max_new_tokens: int = 256) -> str:
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=0.7,
+            temperature=0.9,   # higher temp = more action diversity, fights entropy collapse
             do_sample=True,
             pad_token_id=tokenizer.eos_token_id,
         )
@@ -283,8 +284,13 @@ def _get_persona_request(server_base_url: str, fallback_idx: int) -> str:
 
 # ── main public function ──────────────────────────────────────────────────────
 
-def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
+_current_cycle: int = 1  # updated by collect_rollouts caller
+
+
+def collect_rollouts(episodes: int, server_base_url: str, cycle: int = 1) -> list[dict]:
     """Run episodes and collect (prompt, completion, reward) per agent step."""
+    global _current_cycle
+    _current_cycle = cycle
     rollout_buffer: list[dict] = []
 
     for ep in range(episodes):
@@ -317,11 +323,19 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
         user_needs = _extract_user_needs(persona_request)
         provider_required_fields: dict[str, list[str]] = {}
         check_seen: set[str] = set()
+        last_tool = ""          # for consecutive-repetition penalty
         last_action_sig = ""
         repeat_action_count = 0
 
         episode_reward = 0.0
+        steps_taken = 0
+        tools_called: list[str] = []
+        did_reach_execute = False
+        constraint_satisfied = False
+        termination_reason = "max_steps"
+
         for step in range(MAX_STEPS_PER_EPISODE):
+            steps_taken = step + 1
             prompt = _build_prompt(messages)
             completion = _generate(prompt)
 
@@ -343,10 +357,34 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
                     "tool":       "__invalid_tool__" if status == "unknown_tool" else "__no_tool__",
                     "done":       True,
                 })
+                termination_reason = f"invalid_tool_{status}"
                 break
 
+            tool_name = tool_call.get("tool", "")
             provider_name = tool_call.get("provider_name", "")
-            action_sig = f"{tool_call.get('tool')}::{provider_name}"
+            tools_called.append(tool_name)
+
+            # ── consecutive repetition penalty ────────────────────────────────
+            if tool_name == last_tool and tool_name != "":
+                rep_penalty = -2.0
+                episode_reward += rep_penalty
+                print(
+                    f"[ROLLOUT]   step {step + 1}: consecutive repeat of {tool_name!r} → penalty {rep_penalty}",
+                    flush=True,
+                )
+                rollout_buffer.append({
+                    "prompt":     prompt,
+                    "completion": completion,
+                    "reward":     rep_penalty,
+                    "episode":    ep + 1,
+                    "tool":       f"__repeat_{tool_name}__",
+                    "done":       False,
+                })
+                # still process the action after penalising
+            last_tool = tool_name
+
+            # ── action loop guard (4 identical action signatures) ─────────────
+            action_sig = f"{tool_name}::{provider_name}"
             if action_sig == last_action_sig:
                 repeat_action_count += 1
             else:
@@ -367,15 +405,30 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
                     "done":       True,
                 })
                 episode_reward += -10.0
+                termination_reason = "action_loop"
                 break
 
-            # Force check_provider before execute_transaction
-            if tool_call.get("tool") == "execute_transaction":
+            # ── execute_transaction ordering gate ─────────────────────────────
+            if tool_name == "execute_transaction":
+                did_reach_execute = True
                 if provider_name not in check_seen:
+                    # Hard penalty for skipping check_provider
+                    gate_penalty = -20.0
+                    episode_reward += gate_penalty
                     print(
-                        f"[ROLLOUT]   step {step + 1}: forcing check_provider before execute_transaction for {provider_name}",
+                        f"[ROLLOUT]   step {step + 1}: execute_transaction before check_provider"
+                        f" for {provider_name!r} → penalty {gate_penalty}, forcing check_provider",
                         flush=True,
                     )
+                    rollout_buffer.append({
+                        "prompt":     prompt,
+                        "completion": completion,
+                        "reward":     gate_penalty,
+                        "episode":    ep + 1,
+                        "tool":       "__execute_before_check__",
+                        "done":       False,
+                    })
+                    # Silently run check_provider to unblock the episode
                     tool_call = {"tool": "check_provider", "provider_name": provider_name}
                 elif provider_name in provider_required_fields:
                     tool_call["payload"] = _build_payload_from_required_fields(
@@ -401,7 +454,7 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
                 "done":       done,
             })
 
-            # Cache required fields after a successful check_provider
+            # Cache required fields after check_provider
             if tool_call.get("tool") == "check_provider":
                 check_seen.add(provider_name)
                 parsed_obs = _safe_json_loads(obs_data) if isinstance(obs_data, str) else obs_data
@@ -428,9 +481,9 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
                 retry_completion = json.dumps(retry_call)
                 retry_reward, retry_obs, retry_done = _execute_tool(retry_call, server_base_url)
                 episode_reward += retry_reward
-                done = True  # single corrective retry, then terminate
+                done = True
                 print(
-                    f"[ROLLOUT]   step {step + 1}: corrective retry reward={retry_reward:.1f} done={retry_done}",
+                    f"[ROLLOUT]   step {step + 1}: corrective retry reward={retry_reward:.1f}",
                     flush=True,
                 )
                 rollout_buffer.append({
@@ -443,12 +496,25 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
                 })
                 obs_data = retry_obs
 
+            if done:
+                constraint_satisfied = reward >= 50.0
+                termination_reason = "success" if constraint_satisfied else "constraint_violation"
+                break
+
             messages.append({"role": "assistant", "content": completion})
             messages.append({"role": "user", "content": f"[Tool Result]: {obs_data}"})
 
-            if done:
-                break
-
         print(f"[ROLLOUT] Episode {ep + 1} total reward: {episode_reward:.1f}", flush=True)
+
+        log_episode(
+            cycle=_current_cycle,
+            episode=ep + 1,
+            total_reward=episode_reward,
+            steps_taken=steps_taken,
+            tools_called=tools_called,
+            did_reach_execute=did_reach_execute,
+            constraint_satisfied=constraint_satisfied,
+            termination_reason=termination_reason,
+        )
 
     return rollout_buffer
