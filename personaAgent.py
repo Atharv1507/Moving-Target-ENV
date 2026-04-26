@@ -35,27 +35,46 @@ def _get_persona_llm() -> ChatOpenAI:
     )
 
 def persona_node(state: AgentState):
-    # 1. Randomized Constraint Pool
-    diets = ["Vegan", "Keto", "Gluten-Free" ,"Nut-Free", "Halal "," Low-Carb", "No Restrictions"]
-    budgets = ["$30", "$50", "$100", "No budget"]
-    policies = ["Strictly Refundable", "Flexible", "Cheapest possible (ignore refunds)","Pet Friendly"]
-    merchants = list(MovingTargetEnv().ground_truth.keys())
-    
-    # 2. Pick a random scenario for this episode
-    current_diet = random.choice(diets)
-    current_budget = random.choice(budgets)
-    current_policy = random.choice(policies)
-    current_merchant = random.choice(merchants)
+    # 1) Randomized fintech constraint pool
+    amounts = ["$50", "$200", "$750", "$1000", "₹10,000", "£300"]
+    currencies = ["USD", "INR", "GBP", "EUR"]
+    fee_limits = ["under 1%", "under 2%", "$2 flat max", "no strict fee limit"]
+    settlement_needs = ["instant settlement", "same-day settlement", "1-2 day settlement is fine"]
+    kyc_levels = ["basic KYC only", "full KYC available", "no strict KYC requirement"]
+    providers = list(MovingTargetEnv().ground_truth.keys())
+    transaction_types = [
+        "send money to a bank account",
+        "withdraw platform balance to bank",
+        "pay an invoice",
+        "international transfer",
+        "domestic transfer",
+    ]
+
+    # 2) Pick a random scenario for this episode
+    current_amount = random.choice(amounts)
+    current_currency = random.choice(currencies)
+    current_fee = random.choice(fee_limits)
+    current_settlement = random.choice(settlement_needs)
+    current_kyc = random.choice(kyc_levels)
+    current_provider = random.choice(providers)
+    current_txn_type = random.choice(transaction_types)
 
     system_prompt = (
-        f"You are a client with the following profile for this simulation:\n"
-        f"- Diet: {current_diet}\n"
-        f"- Budget: {current_budget}\n"
-        f"- Refund Policy Preference: {current_policy}\n"
-        f"- Target Merchant: {current_merchant}\n\n"
-        "Your goal is to communicate these needs to your assistant. "
-        "Be natural, sometimes be brief, sometimes be wordy. "
-        "Do not list them as bullet points—act like a human sending a message."
+        "You are a fintech customer sending one request message to an assistant.\n"
+        "Write a natural user request (1-4 sentences) for a payment/transfer use case.\n"
+        f"Use this profile:\n"
+        f"- Transaction intent: {current_txn_type}\n"
+        f"- Amount: {current_amount}\n"
+        f"- Currency: {current_currency}\n"
+        f"- Preferred provider: {current_provider}\n"
+        f"- Fee requirement: {current_fee}\n"
+        f"- Settlement requirement: {current_settlement}\n"
+        f"- KYC condition: {current_kyc}\n\n"
+        "Requirements:\n"
+        "- Mention provider name explicitly.\n"
+        "- Mention amount and currency explicitly.\n"
+        "- Keep it realistic and conversational.\n"
+        "- Do not use bullets or JSON.\n"
     )
     
     persona_llm = _get_persona_llm()
@@ -65,9 +84,14 @@ def persona_node(state: AgentState):
     ])
     
     import requests
+    _env_port = int(os.getenv("ENV_SERVER_PORT", "8001"))
     try:
-        requests.post("http://localhost:8000/set_constraint", json={"constraint": response.content})
-    except:
+        requests.post(
+            f"http://localhost:{_env_port}/set_constraint",
+            json={"constraint": response.content},
+            timeout=5,
+        )
+    except Exception:
         pass
         
     print(response.content)

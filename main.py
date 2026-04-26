@@ -1,4 +1,10 @@
-import pprint
+"""LangGraph simulation entry point for the Fintech Payment Agent."""
+import os
+import re
+import requests
+import dotenv
+dotenv.load_dotenv()
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 
@@ -7,149 +13,131 @@ from personaAgent import persona_node
 from concierge import concierge_node, tools
 from watchdog import watchdog_node
 
+_ENV_PORT = int(os.getenv("ENV_SERVER_PORT", "8001"))
+_SERVER_URL = f"http://localhost:{_ENV_PORT}"
+
+
 def route_concierge_output(state: AgentState):
-    """
-    Routings for the Concierge.
-    If the LLM outputted a tool call (like getMerchant or ask_watchdog), we go to the ToolNode.
-    If the LLM did not output a tool call, we assume it's done.
-    """
+    """Route to tool executor if the LLM issued a tool call, else end the episode."""
     messages = state.get("messages", [])
     if not messages:
         return END
-
     last_message = messages[-1]
-    
-    # Check if the LLM returned any tool calls
     if hasattr(last_message, "tool_calls") and len(last_message.tool_calls) > 0:
         return "tools"
-    
-    # Otherwise, it gave a text response, which means the episode is ending.
     return END
 
-# 1. Initialize the Graph with our AgentState structure
+
+# ── Build graph ───────────────────────────────────────────────────────────────
+
 workflow = StateGraph(AgentState)
 
-# 2. Add the custom nodes we scripted
-workflow.add_node("persona", persona_node)
-workflow.add_node("concierge", concierge_node)
+workflow.add_node("persona",    persona_node)
+workflow.add_node("concierge",  concierge_node)
+workflow.add_node("tools",      ToolNode(tools))
+workflow.add_node("watchdog",   watchdog_node)
 
-# We use the built-in LangGraph ToolNode to automatically execute any tools 
-# the Concierge requests (using the tools array we exported from concierge.py)
-tool_executor = ToolNode(tools)
-workflow.add_node("tools", tool_executor)
+workflow.add_edge(START, "persona")
+workflow.add_edge("persona", "concierge")
 
-# Our Watchdog agent intercepts the raw API outputs
-workflow.add_node("watchdog", watchdog_node)
-
-# 3. Define the Edges (The Flow of the Application)
-workflow.add_edge(START, "persona")             # Start by getting the user's constraints
-workflow.add_edge("persona", "concierge")       # Pass constraints to the Concierge
-
-# The Concierge decides whether to use a tool or finish
 workflow.add_conditional_edges(
     "concierge",
     route_concierge_output,
-    {
-        "tools": "tools",  # If a tool is called, execute it
-        END: END           # If it just replies, we are finished
-    }
+    {"tools": "tools", END: END},
 )
 
-# After the HTTP tool executes, ALWAYS pass the raw data to the Watchdog to check for drift
+# After tool execution, pass through watchdog to detect schema drift, then loop back
 workflow.add_edge("tools", "watchdog")
-
-# Once the Watchdog finishes its analysis, loop back to the Concierge!
 workflow.add_edge("watchdog", "concierge")
 
-# 4. Compile the Graph
 app = workflow.compile()
 
-import requests
 
-# --- MAIN EXECUTION SIMULATION ---
+# ── Main simulation loop ──────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    print("\n[SYSTEM] Compiling and starting the LangGraph Moving Target Simulation...")
-    print("[SYSTEM] Make sure the OpenEnv server is running on localhost:8000!\n")
-    
+    print("\n[SYSTEM] Starting Fintech Payment Agent LangGraph Simulation...")
+    print(f"[SYSTEM] Environment server expected at {_SERVER_URL}\n")
+
     EPISODES = 5
-    lifelong_memory = {}
-    total_lifetime_score = 0
-    prev_episode_summary = ""  # Will be built from the last episode's results
+    lifelong_memory: dict = {}
+    total_lifetime_score = 0.0
+    prev_episode_summary = ""
+
     for episode in range(EPISODES):
-        context_insight=[]
-        print(f"\n=======================================================")
+        print(f"\n{'=' * 55}")
         print(f"               STARTING EPISODE {episode + 1}/{EPISODES}")
-        print(f"=======================================================\n")
-        
-        # 1. Scramble the Environment completely before starting
-        print("[SYSTEM] Sending /reset to OpenEnv Server to randomize schemas...")
+        print(f"{'=' * 55}\n")
+
+        print(f"[SYSTEM] Resetting environment at {_SERVER_URL}/reset ...")
         try:
-            requests.post("http://localhost:8000/reset")
+            requests.post(f"{_SERVER_URL}/reset", timeout=10)
         except Exception as e:
             print(f"[SYSTEM ERROR] Could not reach server: {e}")
             break
 
-        # 2. Give the agent a clean chat history, but let it keep its memories AND its score feedback!
-        initial_state = {
-            "messages": [],
-            "current_merchant": "",
-            "last_known_schema": lifelong_memory,
-            "drift_detected": False,
-            "reward_score": 0.0,
+        initial_state: AgentState = {
+            "messages":             [],
+            "current_provider":     "",
+            "last_known_schema":    lifelong_memory,
+            "drift_detected":       False,
+            "reward_score":         0.0,
             "prev_episode_summary": prev_episode_summary,
-
-            "step_count": 0
+            "step_count":           0,
         }
 
-        # 3. Run the LangGraph
-        episode_score = 0
+        episode_score = 0.0
+        context_insight: list[str] = []
+
         for output in app.stream(initial_state, stream_mode="updates"):
             for node_name, state_update in output.items():
                 print(f"\n--- Output from Node: {node_name} ---")
-                
+
                 if "messages" in state_update:
                     last_msg = state_update["messages"][-1]
-                    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                        print(f"[Tool Call Requested]: {last_msg.tool_calls[0]['name']}({last_msg.tool_calls[0].get('args', {})})")
-                    elif hasattr(last_msg, "name") and getattr(last_msg, "name") in [t.name for t in tools]:
-                        # Extract the reward string
-                        content_str = last_msg.content.strip()
-                        print(f"[HTTP Tool Result]: {content_str}")
-                        
-                        import re
-                        match = re.search(r"\(Environment Reward: ([-\d.]+)\)", content_str)
-                        currScore=0
-                        if match:
-                            currScore=float(match.group(1))
-                            episode_score += currScore
-                            if(currScore<0):
-                                if(currScore<-49):
-                                    reason = content_str.split("\n(Environment")[0].replace("Observation: ", "").strip()
-                                    context_insight.append(f"Tool '{last_msg.name}' lost you {abs(currScore)} points because: {reason}")
 
+                    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                        tc = last_msg.tool_calls[0]
+                        print(f"[Tool Call]: {tc['name']}({tc.get('args', {})})")
+
+                    elif hasattr(last_msg, "name") and getattr(last_msg, "name") in [t.name for t in tools]:
+                        content_str = last_msg.content.strip()
+                        print(f"[Tool Result]: {content_str}")
+
+                        match = re.search(r"\(Environment Reward: ([-\d.]+)\)", content_str)
+                        if match:
+                            curr_score = float(match.group(1))
+                            episode_score += curr_score
+                            if curr_score <= -15.0:
+                                reason = (
+                                    content_str
+                                    .split("\n(Environment")[0]
+                                    .replace("Observation: ", "")
+                                    .strip()
+                                )
+                                context_insight.append(
+                                    f"Tool '{last_msg.name}' cost {abs(curr_score):.0f} pts: {reason}"
+                                )
                     else:
-                        print(f"[{node_name.capitalize()} Message]: {last_msg.content}")
-                
-                if "drift_detected" in state_update:
-                    if state_update["drift_detected"]:
-                        print("--> WARNING: Watchdog flagged a drift!")
-                        
-                # 4. Save the memory generated from this node so it carries to the next episode
+                        print(f"[{node_name.capitalize()}]: {last_msg.content}")
+
+                if state_update.get("drift_detected"):
+                    print("--> WARNING: Watchdog flagged schema drift!")
+
                 if "last_known_schema" in state_update:
                     lifelong_memory = state_update["last_known_schema"]
-                
-        print(f"\n[SYSTEM] Episode {episode + 1} Complete. Episode Score: {episode_score}")
-        print(f"[SYSTEM]: context insight : {context_insight}")
+
+        print(f"\n[SYSTEM] Episode {episode + 1} complete. Score: {episode_score:.1f}")
+        print(f"[SYSTEM] Insights: {context_insight or ['No major mistakes.']}")
         total_lifetime_score += episode_score
-        
-        # Build RL feedback summary for the NEXT episode's Concierge
+
         rl_insights = "\n- ".join(context_insight) if context_insight else "No major mistakes."
         prev_episode_summary = (
-            f"In the last episode (Episode {episode + 1}), you scored {episode_score} points.\n"
-            f"Feedback on your mistakes:\n- {rl_insights}\n"
-            "Analyze this feedback, avoid repeating these mistakes, and improve your strategy."
+            f"In episode {episode + 1} you scored {episode_score:.1f} points.\n"
+            f"Mistakes:\n- {rl_insights}\n"
+            "Avoid repeating these mistakes next episode."
         )
 
-    print(f"\n=======================================================")
-    print(f"[SYSTEM] ALL EPISODES COMPLETE. TOTAL RL SCORE: {total_lifetime_score}")
-    print(f"=======================================================\n")
+    print(f"\n{'=' * 55}")
+    print(f"[SYSTEM] ALL EPISODES COMPLETE. TOTAL SCORE: {total_lifetime_score:.1f}")
+    print(f"{'=' * 55}\n")

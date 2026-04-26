@@ -1,7 +1,7 @@
+"""Watchdog node — detects API schema drift for fintech providers."""
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from state import AgentState
-import json
 import os
 import dotenv
 dotenv.load_dotenv()
@@ -13,94 +13,85 @@ watchdog_llm = ChatOpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
-def watchdog_node(state: AgentState):
-    """
-    The Watchdog Node: Acts as the Technical Scout.
-    It takes the raw schema fetched from the environment, compares it to memory,
-    and alerts the Concierge if the API rules have drifted.
-    """
-    messages = state["messages"]
-    current_merchant = state.get("current_merchant")
-    last_known_registry = state.get("last_known_schema", {})
-    
-    # 1. Find the latest tool execution response in the messages 
-    latest_schema_str = None
 
+def watchdog_node(state: AgentState):
+    """The Watchdog Node: compares newly fetched provider schemas to memory,
+    alerts the Concierge if the API has drifted."""
+    messages = state["messages"]
+    current_provider = state.get("current_provider", "")
+    last_known_registry = state.get("last_known_schema", {})
+
+    # Find the latest check_provider tool result in the message history
+    latest_schema_str = None
     for msg in reversed(messages):
-        if hasattr(msg, 'name') and msg.name == 'ask_watchdog':
+        if hasattr(msg, "name") and msg.name == "check_provider":
             latest_schema_str = msg.content
             break
-            
-    if not latest_schema_str:
 
+    if not latest_schema_str:
         return {"drift_detected": False}
 
-    # 2. Check if we have seen this merchant before
-    last_known_schema = last_known_registry.get(current_merchant)
-    
+    last_known_schema = last_known_registry.get(current_provider)
+
     if not last_known_schema:
-        # Brand new merchant! Log it to memory.
-        last_known_registry[current_merchant] = latest_schema_str
+        # First time seeing this provider — log it
+        last_known_registry[current_provider] = latest_schema_str
         return {
             "last_known_schema": last_known_registry,
             "drift_detected": False,
-            "messages": [SystemMessage(content=f"[Watchdog] Discovered new merchant '{current_merchant}'. Schema saved to memory.")]
+            "messages": [SystemMessage(
+                content=f"[Watchdog] Discovered provider '{current_provider}'. Schema saved to memory."
+            )],
         }
 
-    # 3. If we HAVE seen it, use the LLM to compare for drift.
+    # Compare old vs new schema via LLM
     system_instruction = SystemMessage(content=(
-        "You are an API Schema Watchdog. Your job is to compare an old JSON schema "
-        "with a newly fetched JSON schema and determine if anything changed (Drift).\n"
+        "You are a Fintech API Schema Watchdog. Compare an old provider schema with a newly fetched one.\n"
         "Output ONLY 'SAFE' if they are functionally identical.\n"
-        "If there is a change, Output 'DRIFT:' followed by a very brief 1 sentence summary of what changed."
+        "If anything changed (new field, removed field, fee change, settlement change, etc.), "
+        "output 'DRIFT:' followed by a brief 1-sentence summary of what changed."
     ))
-    
+
     human_prompt = HumanMessage(content=(
         f"Old Schema:\n{last_known_schema}\n\n"
         f"New Schema:\n{latest_schema_str}"
     ))
-    
+
     response = watchdog_llm.invoke([system_instruction, human_prompt])
-    
-    # 4. Process the LLM's review
+
     if response.content.strip().startswith("SAFE"):
         return {"drift_detected": False}
     else:
-        # Update the registry with the new schema so we know it for next time
-        last_known_registry[current_merchant] = latest_schema_str
+        last_known_registry[current_provider] = latest_schema_str
         return {
             "last_known_schema": last_known_registry,
             "drift_detected": True,
-            "messages": [SystemMessage(content=f"[Watchdog ALERT] {response.content}")]
+            "messages": [SystemMessage(
+                content=f"[Watchdog ALERT] Provider '{current_provider}' schema drifted: {response.content}"
+            )],
         }
 
 
-# --- QUICK TEST ---
+# ── quick test ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     from langchain_core.messages import ToolMessage
 
-    # We fake a scenario where the Concierge called ask_watchdog, 
-    # and the environment returned a string with a new field "contact_number".
-    # BUT our memory only remembers ["item", "price"].
-
     fake_state = {
-        "current_merchant": "VeganBistro",
+        "current_provider": "Wise",
         "last_known_schema": {
-            "VeganBistro": '{"required_fields": ["item", "price"], "refund_policy": "Strict"}'
+            "Wise": '{"required_fields": ["amount", "currency"], "transaction_fee": "0.5%"}'
         },
         "messages": [
             ToolMessage(
-                tool_call_id="call_123", 
-                name="ask_watchdog", 
-                content='{"required_fields": ["item", "price", "contact_number"], "refund_policy": "Strict"}'
+                tool_call_id="call_123",
+                name="check_provider",
+                content='{"required_fields": ["amount", "currency", "beneficiary_name"], "transaction_fee": "0.5%"}',
             )
-        ]
+        ],
     }
-    
+
     print("Running Watchdog Node Test...\n")
     result = watchdog_node(fake_state)
-    
-    print("--- Watchdog Output ---")
     print(f"Drift Detected: {result.get('drift_detected')}")
     if result.get("messages"):
-        print(f"Watchdog Message appended: {result['messages'][0].content}")
+        print(f"Watchdog Message: {result['messages'][0].content}")

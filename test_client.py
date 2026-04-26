@@ -1,45 +1,65 @@
-import sys
+"""Quick smoke-test for the Fintech environment server.
+
+Usage:
+    python test_client.py
+
+Make sure the environment server is running first:
+    python -m uvicorn server.app:app --port 8001
+"""
 import asyncio
-from Moving_Target.client import MovingTargetEnv
-from Moving_Target.models import MovingTargetAction
+import os
+import requests
 
-async def main():
-    print("Connecting to OpenEnv Server on localhost:8000...")
-    
-    # We initialize the client to point to the server we started
-    client = MovingTargetEnv(base_url="http://localhost:8000")
-    
-    try:
-        # 1. Always reset the environment at the beginning of a session
-        print("\n--- Resetting Environment ---")
-        reset_result = await client.reset()
-        print(f"Observation Data: {reset_result.observation.data}")
-        print(f"Observation Status: {reset_result.observation.status}")
+_ENV_PORT = int(os.getenv("ENV_SERVER_PORT", "8001"))
+_BASE_URL = f"http://localhost:{_ENV_PORT}"
 
-        # 2. Let's use the Scout Tool (ask_watchdog)
-        print("\n--- Testing Scout Tool: ask_watchdog ---")
-        scout_action = MovingTargetAction(tool="ask_watchdog", merchant_name="VeganBistro")
-        scout_result = await client.step(scout_action)
-        print(f"Observation Data: {scout_result.observation.data}")
-        print(f"Observation Status: {scout_result.observation.status}")
 
-        # 3. Let's test the Executioner Tool with a bad payload
-        print("\n--- Testing Executioner Tool: place_order (BAD payload) ---")
-        bad_order_action = MovingTargetAction(
-            tool="place_order", 
-            merchant_name="VeganBistro", 
-            payload={"item": "Salad"} # missing price
-        )
-        bad_result = await client.step(bad_order_action)
-        print(f"Observation Data: {bad_result.observation.data}")
-        print(f"Observation Status: {bad_result.observation.status}")
-        
-    except Exception as e:
-        print(f"Connection Error: {e}")
-        print("Make sure your server is running via `python -m server.app`")
-    finally:
-        # Keep things tidy by closing out the connection
-        await client.close()
+def main():
+    print(f"Connecting to Fintech Environment Server at {_BASE_URL} ...\n")
+
+    # 1. Reset
+    print("--- Resetting Environment ---")
+    r = requests.post(f"{_BASE_URL}/reset", timeout=10)
+    print(f"Status: {r.status_code}  Body: {r.json()}\n")
+
+    # 2. get_providers
+    print("--- Tool: get_providers ---")
+    r = requests.post(
+        f"{_BASE_URL}/step",
+        json={"action": {"tool": "get_providers", "provider_name": "directory"}},
+        timeout=10,
+    )
+    obs = r.json().get("observation", {})
+    print(f"Status: {r.status_code}  Reward: {obs.get('reward')}  Data: {obs.get('data')}\n")
+
+    # 3. check_provider — Wise
+    print("--- Tool: check_provider (Wise) ---")
+    r = requests.post(
+        f"{_BASE_URL}/step",
+        json={"action": {"tool": "check_provider", "provider_name": "Wise"}},
+        timeout=10,
+    )
+    obs = r.json().get("observation", {})
+    print(f"Status: {r.status_code}  Reward: {obs.get('reward')}  Data: {obs.get('data')}\n")
+
+    # 4. execute_transaction — intentionally bad payload (missing required field)
+    print("--- Tool: execute_transaction (bad payload — missing fields) ---")
+    r = requests.post(
+        f"{_BASE_URL}/step",
+        json={
+            "action": {
+                "tool": "execute_transaction",
+                "provider_name": "Wise",
+                "payload": {"amount": "200"},  # intentionally incomplete
+            }
+        },
+        timeout=10,
+    )
+    obs = r.json().get("observation", {})
+    print(f"Status: {r.status_code}  Reward: {obs.get('reward')}  Data: {obs.get('data')}\n")
+
+    print("Smoke test complete.")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
