@@ -254,7 +254,7 @@ def train_with_grpo(
         gradient_accumulation_steps=2,
         # Generation: 8 completions for diversity, higher temp for exploration
         num_generations=8,
-        max_completion_length=256,
+        max_completion_length=64,   # tool calls are never longer than this; was 256 causing 19s/step
         temperature=0.9,
         # Optimiser
         learning_rate=1e-5,

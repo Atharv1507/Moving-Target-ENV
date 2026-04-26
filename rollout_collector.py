@@ -35,26 +35,29 @@ CONCIERGE_SYSTEM_PROMPT = (
     "3. If constraints are satisfied, call execute_transaction\n"
     "Never call the same tool twice in a row.\n"
     "Always use the provider name the user mentioned.\n\n"
-    "TOOL FORMAT — output EXACTLY one JSON object per turn, nothing else:\n"
-    '- {"tool": "getProviders"}\n'
-    '- {"tool": "check_provider", "provider_name": "NAME"}\n'
-    '- {"tool": "execute_transaction", "provider_name": "NAME", "payload": {"field": "value"}}\n\n'
-    "RULES:\n"
-    "1. The execute_transaction payload must contain EXACTLY the fields from check_provider's required_fields — no more, no less.\n"
-    "2. Match the user's constraints: fee limit, currency, KYC level, settlement time.\n"
-    "3. Invent any missing details (sender name, account numbers, reference) — do NOT ask the user.\n"
-    "4. If execute_transaction fails, call check_provider again (schema may have drifted), then retry.\n"
-    "5. ONLY after a successful execute_transaction, write a plain text confirmation.\n\n"
+    "Available tools and their required JSON schemas:\n\n"
+    "1. getProviders — list all available payment providers\n"
+    '{"tool": "getProviders"}\n\n'
+    "2. check_provider — verify a specific provider meets constraints\n"
+    '{"tool": "check_provider", "provider_name": "<string>"}\n\n'
+    "3. execute_transaction — complete the purchase\n"
+    '{"tool": "execute_transaction", "provider_name": "<string>", "payload": {"amount": "<string>", "currency": "USD", "account_number": "<string>", "transaction_id": "<string>"}}\n\n'
+    "Rules:\n"
+    "- Only output valid JSON matching one of the above schemas\n"
+    "- Never call the same tool twice in a row\n"
+    "- Sequence: getProviders → check_provider → execute_transaction\n"
+    "- Use the provider name the user mentioned in check_provider\n"
+    "- The execute_transaction payload must contain EXACTLY the fields from check_provider's required_fields\n"
+    "- Invent any missing details (account numbers, IDs) — do NOT ask the user\n\n"
     "EXAMPLE:\n"
     'User: "Send $200 via Wise, fee under 2%"\n'
     'You: {"tool": "getProviders"}\n'
-    '[Tool Result]: ["Stripe", "Razorpay", "Wise"]\n'
+    'Tool result: ["Stripe", "Razorpay", "Wise"]\n'
     'You: {"tool": "check_provider", "provider_name": "Wise"}\n'
-    '[Tool Result]: {"required_fields": ["amount", "currency", "beneficiary_name"], "transaction_fee": "0.5%"}\n'
+    'Tool result: {"required_fields": ["amount", "currency", "beneficiary_name"], "transaction_fee": "0.5%"}\n'
     'You: {"tool": "execute_transaction", "provider_name": "Wise", "payload": {"amount": "200", "currency": "USD", "beneficiary_name": "Raj Kumar"}}\n'
-    '[Tool Result]: Transaction successful.\n'
-    'You: Sent $200 via Wise at 0.5% fee.\n\n'
-    "Every response is a JSON tool call until execute_transaction succeeds. NO plain text before that."
+    'Tool result: Transaction successful.\n'
+    'You: Sent $200 via Wise at 0.5% fee.'
 )
 
 # Model tool name → environment server tool name
@@ -406,12 +409,13 @@ def collect_rollouts(episodes: int, server_base_url: str, cycle: int = 1) -> lis
                 break
 
             # ── execute_transaction ordering gate ─────────────────────────────
+            gate_fired = False
             if tool_name == "execute_transaction":
                 did_reach_execute = True
                 if provider_name not in check_seen:
-                    # Hard penalty for skipping check_provider
                     gate_penalty = -20.0
                     episode_reward += gate_penalty
+                    gate_fired = True
                     print(
                         f"[ROLLOUT]   step {step + 1}: execute_transaction before check_provider"
                         f" for {provider_name!r} → penalty {gate_penalty}, forcing check_provider",
@@ -425,7 +429,14 @@ def collect_rollouts(episodes: int, server_base_url: str, cycle: int = 1) -> lis
                         "tool":       "__execute_before_check__",
                         "done":       False,
                     })
-                    # Silently run check_provider to unblock the episode
+                    # Feed model the penalty message before running forced check_provider
+                    messages.append({"role": "assistant", "content": completion})
+                    messages.append({
+                        "role": "user",
+                        "content": f"Tool result: ERROR — you must call check_provider for '{provider_name}' before execute_transaction.",
+                    })
+                    # Rebuild prompt with updated context, then silently run check_provider
+                    prompt = _build_prompt(messages)
                     tool_call = {"tool": "check_provider", "provider_name": provider_name}
                 elif provider_name in provider_required_fields:
                     tool_call["payload"] = _build_payload_from_required_fields(
@@ -444,7 +455,7 @@ def collect_rollouts(episodes: int, server_base_url: str, cycle: int = 1) -> lis
 
             rollout_buffer.append({
                 "prompt":     prompt,
-                "completion": completion,
+                "completion": completion if not gate_fired else json.dumps(tool_call),
                 "reward":     reward,
                 "episode":    ep + 1,
                 "tool":       tool_call.get("tool", "unknown"),
@@ -476,6 +487,9 @@ def collect_rollouts(episodes: int, server_base_url: str, cycle: int = 1) -> lis
                     ),
                 }
                 retry_completion = json.dumps(retry_call)
+                # Feed the rejection into context before retry
+                messages.append({"role": "assistant", "content": completion})
+                messages.append({"role": "user", "content": f"Tool result: {obs_data}"})
                 retry_reward, retry_obs, retry_done = _execute_tool(retry_call, server_base_url)
                 episode_reward += retry_reward
                 done = True
@@ -484,7 +498,7 @@ def collect_rollouts(episodes: int, server_base_url: str, cycle: int = 1) -> lis
                     flush=True,
                 )
                 rollout_buffer.append({
-                    "prompt":     prompt,
+                    "prompt":     _build_prompt(messages),
                     "completion": retry_completion,
                     "reward":     retry_reward,
                     "episode":    ep + 1,
@@ -493,13 +507,17 @@ def collect_rollouts(episodes: int, server_base_url: str, cycle: int = 1) -> lis
                 })
                 obs_data = retry_obs
 
+            # Always feed the tool result back into context before the done check.
+            # This ensures the model sees full conversation history on every step,
+            # including the final successful turn (needed if done is reset by retry).
+            if not gate_fired:
+                messages.append({"role": "assistant", "content": completion})
+            messages.append({"role": "user", "content": f"Tool result: {obs_data}"})
+
             if done:
                 constraint_satisfied = reward >= 50.0
                 termination_reason = "success" if constraint_satisfied else "constraint_violation"
                 break
-
-            messages.append({"role": "assistant", "content": completion})
-            messages.append({"role": "user", "content": f"[Tool Result]: {obs_data}"})
 
         print(f"[ROLLOUT] Episode {ep + 1} total reward: {episode_reward:.1f}", flush=True)
 
