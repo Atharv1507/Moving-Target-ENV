@@ -21,7 +21,7 @@ from training_logger import log_step, log_cycle
 
 # Entropy regularisation coefficient — added directly to reward since
 # GRPOConfig.entropy_coef does not exist in any released TRL version.
-ENTROPY_COEF = 0.01
+ENTROPY_COEF = 0.05
 
 SERVER_URL = os.getenv("ENV_SERVER_URL", "http://localhost:8001/")
 ALLOWED_TOOLS = {"getProviders", "check_provider", "execute_transaction"}

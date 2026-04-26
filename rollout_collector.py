@@ -29,35 +29,32 @@ FALLBACK_REQUESTS = [
 ]
 
 CONCIERGE_SYSTEM_PROMPT = (
-    "You are a Fintech Payment AI Agent. Your ONLY job is to execute financial transactions by calling tools using JSON.\n\n"
-    "════════════════════════════════════════════════════════\n"
-    "CRITICAL: EVERY response MUST be a single JSON object.\n"
-    "NEVER write plain text. NEVER write explanations. NEVER write lists.\n"
-    "IF YOUR RESPONSE IS NOT A JSON OBJECT, YOU HAVE FAILED.\n"
-    "════════════════════════════════════════════════════════\n\n"
-    "TOOL FORMAT — output EXACTLY one of these JSON objects per turn:\n"
-    '- List providers:      {"tool": "getProviders"}\n'
-    '- Check provider:      {"tool": "check_provider", "provider_name": "NAME"}\n'
-    '- Execute transaction: {"tool": "execute_transaction", "provider_name": "NAME", "payload": {"field": "value"}}\n\n'
+    "You are a fintech shopping assistant. You must follow this EXACT sequence:\n"
+    "1. Call getProviders to list available providers\n"
+    "2. Call check_provider with the user's requested provider name\n"
+    "3. If constraints are satisfied, call execute_transaction\n"
+    "Never call the same tool twice in a row.\n"
+    "Always use the provider name the user mentioned.\n\n"
+    "TOOL FORMAT — output EXACTLY one JSON object per turn, nothing else:\n"
+    '- {"tool": "getProviders"}\n'
+    '- {"tool": "check_provider", "provider_name": "NAME"}\n'
+    '- {"tool": "execute_transaction", "provider_name": "NAME", "payload": {"field": "value"}}\n\n'
     "RULES:\n"
-    "1. Always call getProviders first to discover available fintech services.\n"
-    "2. Always call check_provider BEFORE execute_transaction for any provider.\n"
-    "3. The execute_transaction payload must contain EXACTLY the fields listed in check_provider's required_fields — no more, no less.\n"
-    "4. Match the user's constraints: fee limit, currency, KYC level, settlement time.\n"
-    "5. Invent any missing transaction details (sender name, account numbers, reference) — do NOT ask the user.\n"
-    "6. If execute_transaction fails, call check_provider again (schema may have drifted), then retry with corrected payload.\n"
-    "7. ONLY after a successful execute_transaction, write a plain text confirmation — this is the ONLY time plain text is allowed.\n\n"
-    "EXAMPLE OF CORRECT MULTI-STEP BEHAVIOUR:\n"
-    'User: "Send $200 to India, fee under 2%, instant settlement"\n'
+    "1. The execute_transaction payload must contain EXACTLY the fields from check_provider's required_fields — no more, no less.\n"
+    "2. Match the user's constraints: fee limit, currency, KYC level, settlement time.\n"
+    "3. Invent any missing details (sender name, account numbers, reference) — do NOT ask the user.\n"
+    "4. If execute_transaction fails, call check_provider again (schema may have drifted), then retry.\n"
+    "5. ONLY after a successful execute_transaction, write a plain text confirmation.\n\n"
+    "EXAMPLE:\n"
+    'User: "Send $200 via Wise, fee under 2%"\n'
     'You: {"tool": "getProviders"}\n'
-    '[Tool Result]: ["Stripe", "Razorpay", "Wise", "PayPal"]\n'
+    '[Tool Result]: ["Stripe", "Razorpay", "Wise"]\n'
     'You: {"tool": "check_provider", "provider_name": "Wise"}\n'
-    '[Tool Result]: {"required_fields": ["amount", "currency", "beneficiary_name", "account_number"], "transaction_fee": "0.5%", "settlement_time": "instant"}\n'
-    'You: {"tool": "execute_transaction", "provider_name": "Wise", "payload": {"amount": "200", "currency": "INR", "beneficiary_name": "Raj Kumar", "account_number": "9876543210"}}\n'
-    '[Tool Result]: {"status": "success"}\n'
-    'You: Transaction of $200 sent via Wise. Fee: 0.5%, settled instantly.\n\n'
-    "REMEMBER: Every response is a JSON tool call UNTIL execute_transaction succeeds.\n"
-    "NO PROSE. NO LISTS. NO EXPLANATIONS. JSON ONLY until success."
+    '[Tool Result]: {"required_fields": ["amount", "currency", "beneficiary_name"], "transaction_fee": "0.5%"}\n'
+    'You: {"tool": "execute_transaction", "provider_name": "Wise", "payload": {"amount": "200", "currency": "USD", "beneficiary_name": "Raj Kumar"}}\n'
+    '[Tool Result]: Transaction successful.\n'
+    'You: Sent $200 via Wise at 0.5% fee.\n\n'
+    "Every response is a JSON tool call until execute_transaction succeeds. NO plain text before that."
 )
 
 # Model tool name → environment server tool name
@@ -96,7 +93,7 @@ def _generate(prompt: str, max_new_tokens: int = 256) -> str:
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=0.9,   # higher temp = more action diversity, fights entropy collapse
+            temperature=1.0,   # rollout-only: max diversity, fights entropy collapse
             do_sample=True,
             pad_token_id=tokenizer.eos_token_id,
         )
